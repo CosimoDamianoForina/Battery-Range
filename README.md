@@ -1,4 +1,8 @@
-# Battery Range
+<p align="center">
+<img width="640" height="320" alt="Battery-Range" src="https://github.com/user-attachments/assets/998a9075-3fa1-4dab-bc0f-19a3f1e8af5b" />
+</p>
+
+# Battery-Range
 
 A smart battery charging manager for Windows laptops that helps extend battery lifespan by maintaining charge within optimal State of Charge (SoC) ranges using a Tasmota-compatible smart plug.
 
@@ -9,7 +13,7 @@ Lithium-ion batteries degrade faster when kept at 100% charge or frequently deep
 ## Features
 
 - **Automatic Battery Management** - Maintains battery within configurable SoC ranges
-- **Dual Range Profiles** - Normal (35-45%) and High (45-55%) modes for different needs
+- **Dual Range Profiles** - Normal (35-45%) and High (70-80%) modes for different needs
 - **Manual Override** - Force charger on/off when needed
 - **System Tray Integration** - Unobtrusive operation with right-click context menu
 - **Failure Notifications** - Alerts you to manually plug/unplug if smart plug is unreachable
@@ -19,8 +23,8 @@ Lithium-ion batteries degrade faster when kept at 100% charge or frequently deep
 
 - Windows 10/11
 - PowerShell 5.1 or later
-- Tasmota-compatible Wi-Fi smart plug
-- Network connectivity between laptop and smart plug
+- Tasmota-compatible Wi-Fi smart plug (see [Devices with Factory Flashed Tasmota](https://templates.blakadder.com/preflashed.html))
+- Network connectivity between laptop and smart plug (regular Wi-Fi network or Windows Mobile Hotspot)
 
 ## Quick Start
 
@@ -37,7 +41,7 @@ Lithium-ion batteries degrade faster when kept at 100% charge or frequently deep
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `-TasmotaPlugIP` | `192.168.137.101` | IP address of the Tasmota smart plug |
-| `-CheckIntervalSeconds` | `30` | How often to check battery status (10-300) |
+| `-CheckIntervalSeconds` | `30` | How often to check battery status (10-300 s) |
 | `-MaxBatteryLevel` | `45` | Maximum battery % for Auto mode |
 | `-MinBatteryLevel` | `35` | Minimum battery % for Auto mode |
 | `-MaxBatteryLevelHigh` | `80` | Maximum battery % for Auto High mode |
@@ -53,8 +57,8 @@ Lithium-ion batteries degrade faster when kept at 100% charge or frequently deep
 
 | Mode | Description |
 |------|-------------|
-| **Auto** | Maintains battery between MinBatteryLevel and MaxBatteryLevel (default: 35-45%) |
-| **Auto High** | Maintains battery between MinBatteryLevelHigh and MaxBatteryLevelHigh (default: 70-80%) |
+| **Auto** | Maintains battery between `MinBatteryLevel` and `MaxBatteryLevel` (default: 35-45%) |
+| **Auto High** | Maintains battery between `MinBatteryLevelHigh` and `MaxBatteryLevelHigh` (default: 70-80%) |
 | **Charger On** | Forces charger on continuously (useful before travel) |
 | **Charger Off** | Forces charger off continuously |
 
@@ -100,13 +104,13 @@ Adjust the IP addresses to match your network configuration.
 2. Create a shortcut to run the script:
    - Right-click → New → Shortcut
    - Target: `powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File "[path to the script]\Battery-Range.ps1"`
-   - Name: `Battery Range`
+   - Name: `Battery-Range`
 
 ## How It Works
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    Battery Range                        │
+│                    Battery-Range                        │
 ├─────────────────────────────────────────────────────────┤
 │                                                         │
 │   Check Battery Level (every N seconds)                 │
@@ -155,3 +159,4 @@ Contributions are welcome! Please open an issue or submit a pull request.
 ## Acknowledgments
 
 - [Tasmota](https://github.com/arendst/tasmota) - Open source firmware for ESP8266/ESP32 devices
+
