@@ -40,12 +40,14 @@ Lithium-ion batteries degrade faster when kept at 100% charge or frequently deep
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `-TasmotaPlugIP` | `192.168.137.101` | IP address of the Tasmota smart plug |
-| `-CheckIntervalSeconds` | `30` | How often to check battery status (10-300 s) |
-| `-MaxBatteryLevel` | `45` | Maximum battery % for Auto mode |
-| `-MinBatteryLevel` | `35` | Minimum battery % for Auto mode |
-| `-MaxBatteryLevelHigh` | `80` | Maximum battery % for Auto High mode |
-| `-MinBatteryLevelHigh` | `70` | Minimum battery % for Auto High mode |
+| `-TasmotaPlugIP` | 192.168.137.101 | IP address of the Tasmota smart plug |
+| `-TasmotaTimeoutSeconds` | 2 | Timeout in seconds for the Tasmota smart plug |
+| `-ConfirmationDelayMilliseconds` | 1000 | Delay in milliseconds before confirming the status |
+| `-CheckIntervalSeconds` | 30 | How often to check battery status |
+| `-MaxBatteryLevel` | 45 | Maximum battery % for Auto mode |
+| `-MinBatteryLevel` | 35 | Minimum battery % for Auto mode |
+| `-MaxBatteryLevelHigh` | 80 | Maximum battery % for Auto High mode |
+| `-MinBatteryLevelHigh` | 70 | Minimum battery % for Auto High mode |
 
 ### Example with Custom Settings
 
@@ -133,11 +135,12 @@ Adjust the IP addresses to match your network configuration.
 └─────────────────────────────────────────────────────────┘
 ```
 
-## Safety Notes
+## Robustness Notes
 
 - **On Exit**: The script automatically turns the charger ON when exiting to prevent accidental battery drain
+- **Power Outages**: If the smart plug loses power, it will restore its previous state when power returns (default Tasmota behavior)
 - **Plug Failures**: If the smart plug is unreachable, a Windows notification prompts manual action
-- **Power Outages**: If the plug loses power, it will restore its previous state when power returns (default Tasmota behavior)
+- **Wiring Issues**: If the the battery charging status is inconsistent with the smart plug status, a notification prompts the user to check the charger connection 
 
 ## Troubleshooting
 
@@ -159,4 +162,3 @@ Contributions are welcome! Please open an issue or submit a pull request.
 ## Acknowledgments
 
 - [Tasmota](https://github.com/arendst/tasmota) - Open source firmware for ESP8266/ESP32 devices
-
