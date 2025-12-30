@@ -38,16 +38,17 @@ Lithium-ion batteries degrade faster when kept at 100% charge or frequently deep
 
 ## Parameters
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `-TasmotaPlugIP` | 192.168.137.101 | IP address of the Tasmota smart plug |
-| `-TasmotaTimeoutSeconds` | 2 | Timeout in seconds for the Tasmota smart plug |
-| `-ConfirmationDelayMilliseconds` | 1000 | Delay in milliseconds before confirming the status |
-| `-CheckIntervalSeconds` | 30 | How often to check battery status |
-| `-MaxBatteryLevel` | 45 | Maximum battery % for Auto mode |
-| `-MinBatteryLevel` | 35 | Minimum battery % for Auto mode |
-| `-MaxBatteryLevelHigh` | 80 | Maximum battery % for Auto High mode |
-| `-MinBatteryLevelHigh` | 70 | Minimum battery % for Auto High mode |
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `-TasmotaTimeoutSeconds` | 2 | 1-5 | Timeout in seconds for the Tasmota smart plug |
+| `-ConfirmationTimeoutSeconds` | 5 | 1-10 | Timeout for confirming charging state change |
+| `-CheckIntervalSeconds` | 30 | 15-300 | How often to check battery status |
+| `-MaxBatteryLevel` | 45 | 20-100 | Maximum battery % for Auto mode |
+| `-MinBatteryLevel` | 35 | 10-99 | Minimum battery % for Auto mode |
+| `-MaxBatteryLevelHigh` | 80 | 20-100 | Maximum battery % for Auto High mode |
+| `-MinBatteryLevelHigh` | 70 | 10-99 | Minimum battery % for Auto High mode |
+
+**Min values must be less than their corresponding Max values.**
 
 ### Example with Custom Settings
 
@@ -63,6 +64,20 @@ Lithium-ion batteries degrade faster when kept at 100% charge or frequently deep
 | **Auto High** | Maintains battery between `MinBatteryLevelHigh` and `MaxBatteryLevelHigh` (default: 70-80%) |
 | **Charger On** | Forces charger on continuously (useful before travel) |
 | **Charger Off** | Forces charger off continuously |
+
+## System Tray Icon
+
+The tray icon provides at-a-glance status:
+
+| Element | Meaning |
+|---------|---------|
+| **Number** | Current battery percentage |
+| **Text color: Green** | Laptop is on AC power |
+| **Text color: White** | Laptop is on battery |
+| **Border: Blue** | Auto mode |
+| **Border: Magenta** | Auto High mode |
+| **Border: Green** | Charger On mode |
+| **Border: Orange** | Charger Off mode |
 
 ## Tasmota Smart Plug Setup
 
@@ -119,13 +134,13 @@ Adjust the IP addresses to match your network configuration.
 │              │                                          │
 │              ▼                                          │
 │   ┌─────────────────────┐                               │
-│   │  Battery < Min%     │──Yes──► Turn ON Smart Plug    │
+│   │  Battery ≤ Min%     │──Yes──► Turn ON Smart Plug    │
 │   │  AND discharging?   │                               │
 │   └─────────────────────┘                               │
 │              │ No                                       │
 │              ▼                                          │
 │   ┌─────────────────────┐                               │
-│   │  Battery > Max%     │──Yes──► Turn OFF Smart Plug   │
+│   │  Battery ≥ Max%     │──Yes──► Turn OFF Smart Plug   │
 │   │  AND charging?      │                               │
 │   └─────────────────────┘                               │
 │              │ No                                       │
@@ -140,7 +155,7 @@ Adjust the IP addresses to match your network configuration.
 - **On Exit**: The script automatically turns the charger ON when exiting to prevent accidental battery drain
 - **Power Outages**: If the smart plug loses power, it will restore its previous state when power returns (default Tasmota behavior)
 - **Plug Failures**: If the smart plug is unreachable, a Windows notification prompts manual action
-- **Wiring Issues**: If the the battery charging status is inconsistent with the smart plug status, a notification prompts the user to check the charger connection 
+- **Wiring Issues**: If the battery charging status is inconsistent with the smart plug status, a notification prompts the user to check the charger connection 
 
 ## Troubleshooting
 
@@ -162,3 +177,4 @@ Contributions are welcome! Please open an issue or submit a pull request.
 ## Acknowledgments
 
 - [Tasmota](https://github.com/arendst/tasmota) - Open source firmware for ESP8266/ESP32 devices
+

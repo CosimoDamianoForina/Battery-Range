@@ -12,7 +12,7 @@
     - Normal and High SoC range profiles
     - Manual charger control override
     - System tray integration with context menu
-    - Smart plug failure notifications with manual action prompts
+    - Failure notifications with manual action prompts
 
 .NOTES
     File Name      : Battery-Range.ps1
@@ -59,19 +59,19 @@ param (
     [ValidateRange(1, 5)]
     [int]$TasmotaTimeoutSeconds = 2,
 
-    [Parameter(HelpMessage = "Delay in milliseconds before confirming the status")]
-    [ValidateRange(100, 5000)]
-    [int]$ConfirmationDelayMilliseconds = 1000,
+    [Parameter(HelpMessage = "Timeout in seconds for confirming charging state change")]
+    [ValidateRange(1, 10)]
+    [int]$ConfirmationTimeoutSeconds = 5,
 
     [Parameter(HelpMessage = "Battery check interval in seconds")]
-    [ValidateRange(10, 300)]
+    [ValidateRange(15, 300)]
     [int]$CheckIntervalSeconds = 30,
 
-    [Parameter(HelpMessage = "Maximum battery level for normal Auto mode")]
+    [Parameter(HelpMessage = "Maximum battery level for Auto mode")]
     [ValidateRange(20, 100)]
     [int]$MaxBatteryLevel = 45,
 
-    [Parameter(HelpMessage = "Minimum battery level for normal Auto mode")]
+    [Parameter(HelpMessage = "Minimum battery level for Auto mode")]
     [ValidateRange(10, 99)]
     [int]$MinBatteryLevel = 35,
 
@@ -118,49 +118,77 @@ try {
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Warning
         ) | Out-Null
-        exit
+
+        # Dispose mutex before exiting
+        $script:mutex.Dispose()
+        return
     }
 }
 catch {
     Write-Host "Error: Could not create mutex." -ForegroundColor Red
-    exit
+    return
 }
+
+# Set DPI awareness
+if (-not ('DPI' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+public class DPI {
+    [DllImport("user32.dll")]
+    public static extern bool SetProcessDPIAware();
+}
+'@
+}
+[DPI]::SetProcessDPIAware() | out-null
 
 # Load required assemblies
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# Add icon extraction capability from system DLLs
-Add-Type -TypeDefinition @"
+# Add icon helper for destroying icon handles
+if (-not ('IconHelper' -as [type])) {
+    Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
-using System.Drawing;
 
-public class IconExtractor {
-    [DllImport("shell32.dll", CharSet = CharSet.Auto)]
-    private static extern IntPtr ExtractIcon(IntPtr hInst, string lpszExeFileName, int nIconIndex);
-
+public class IconHelper {
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool DestroyIcon(IntPtr hIcon);
+    public static extern bool DestroyIcon(IntPtr hIcon);
+}
+'@
+}
 
-    public static Icon Extract(string filePath, int iconIndex) {
-        IntPtr hIcon = ExtractIcon(IntPtr.Zero, filePath, iconIndex);
-        if (hIcon == IntPtr.Zero) return null;
+# Add power status helper for fast AC/battery detection
+if (-not ('PowerStatus' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
 
-        try {
-            Icon icon = Icon.FromHandle(hIcon);
-            return (Icon)icon.Clone();
+public class PowerStatus {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SYSTEM_POWER_STATUS {
+        public byte ACLineStatus;        // 0=Offline, 1=Online, 255=Unknown
+        public byte BatteryFlag;         // Battery charge status flags
+        public byte BatteryLifePercent;  // 0-100, or 255 if unknown
+        public byte SystemStatusFlag;    // 0=Battery saver off, 1=on
+        public int BatteryLifeTime;      // Seconds remaining, -1 if unknown
+        public int BatteryFullLifeTime;  // Seconds for full battery, -1 if unknown
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetSystemPowerStatus(out SYSTEM_POWER_STATUS lpSystemPowerStatus);
+
+    public static SYSTEM_POWER_STATUS GetStatus() {
+        SYSTEM_POWER_STATUS status;
+        if (!GetSystemPowerStatus(out status)) {
+            throw new System.ComponentModel.Win32Exception();
         }
-        finally {
-            DestroyIcon(hIcon);
-        }
+        return status;
     }
 }
-"@ -ReferencedAssemblies System.Drawing
-
-# Global state - Modes: "Auto", "AutoHigh", "ChargerOn", "ChargerOff"
-$script:currentMode = "Auto"
+'@
+}
 
 function SendWindowsNotification {
     [CmdletBinding()]
@@ -203,19 +231,43 @@ function SendWindowsNotification {
 }
 
 function Get-BatteryStatus {
-    $battery = Get-CimInstance -ClassName Win32_Battery
-    $estimatedCharge = $battery.estimatedChargeRemaining
-    $batteryStatus = $battery.BatteryStatus
+    try {
+        $status = [PowerStatus]::GetStatus()
 
-    # 1=Discharging, 2=Unknown/AC, 6=Charging, 7=ChargingHigh, 8=ChargingLow, 9=ChargingCritical
-    # Note: Status 2 often means "Plugged in, not charging" (e.g. at 100% or threshold limit)
-    $chargingStatuses = @(2, 6, 7, 8, 9)
-    $isCharging = $batteryStatus -in $chargingStatuses
+        # ACLineStatus: 0 = Offline (on battery), 1 = Online (on AC), 255 = Unknown
+        $onAC = switch ($status.ACLineStatus) {
+            0       { $false }  # On battery
+            1       { $true }   # On AC power
+            default {
+                Write-Warning "AC line status unknown - assuming on AC"
+                $true
+            }
+        }
 
-    return @{
-        Charge     = $estimatedCharge
-        IsCharging = $isCharging
+        # BatteryLifePercent: 0-100, or 255 if unknown/no battery
+        $batteryCharge = $status.BatteryLifePercent
+        if ($batteryCharge -eq 255) {
+            Write-Warning "Battery percentage unknown (no battery?) - assuming 0%"
+            $batteryCharge = 0
+        }
+
+        $script:lastBatteryStatus = @{
+            BatteryCharge = $batteryCharge
+            OnAC = $onAC
+        }
     }
+    catch {
+        Write-Warning "Failed to get power status: $($_.Exception.Message)"
+        # Return defaults
+        $script:lastBatteryStatus = @{
+            BatteryCharge = 0
+            OnAC   = $true
+        }
+    }
+
+    Update-TrayIcon
+
+    return $script:lastBatteryStatus
 }
 
 function Set-TasmotaPlug {
@@ -239,50 +291,191 @@ function Set-TasmotaPlug {
     }
 }
 
+function Draw-BatteryIcon {
+    param (
+        [int]$BatteryPercent,
+        [bool]$OnAC,
+        [string]$Mode
+    )
+
+    $bitmap = $null
+    $graphics = $null
+
+    try {
+        # Create a 16x16 bitmap (standard tray icon size)
+        $bitmap = New-Object System.Drawing.Bitmap(16, 16)
+        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+
+        # Mode-specific border colors
+        $borderColor = switch ($Mode) {
+            "Auto"       { [System.Drawing.Color]::DodgerBlue }
+            "AutoHigh"   { [System.Drawing.Color]::Magenta }
+            "ChargerOn"  { [System.Drawing.Color]::LimeGreen }
+            "ChargerOff" { [System.Drawing.Color]::OrangeRed }
+            default      { [System.Drawing.Color]::Gray }
+        }
+
+        # Fill with black background
+        $graphics.Clear([System.Drawing.Color]::Black)
+
+        # Draw border using filled rectangles
+        $borderBrush = New-Object System.Drawing.SolidBrush($borderColor)
+        try {
+            $graphics.FillRectangle($borderBrush, 0, 0, 16, 1)   # Top
+            $graphics.FillRectangle($borderBrush, 0, 15, 16, 1)  # Bottom
+            $graphics.FillRectangle($borderBrush, 0, 0, 1, 16)   # Left
+            $graphics.FillRectangle($borderBrush, 15, 0, 1, 16)  # Right
+        }
+        finally {
+            $borderBrush.Dispose()
+        }
+
+        # Text color: green if on AC, white if on battery
+        $textColor = if ($OnAC) {
+            [System.Drawing.Color]::Lime
+        } else {
+            [System.Drawing.Color]::White
+        }
+
+        $textBrush = New-Object System.Drawing.SolidBrush($textColor)
+        # Use smaller font for 3-digit numbers (100)
+        $fontSize = if ($BatteryPercent -gt 99) { 4 } else { 6 }
+        $font = New-Object System.Drawing.Font("Segoe UI", $fontSize, [System.Drawing.FontStyle]::Bold)
+        $format = New-Object System.Drawing.StringFormat
+
+        try {
+            $format.Alignment = [System.Drawing.StringAlignment]::Center
+            $format.LineAlignment = [System.Drawing.StringAlignment]::Center
+
+            $text = $BatteryPercent.ToString()
+            # Rectangle for text
+            $rect = New-Object System.Drawing.RectangleF(0, 0, 16, 16)
+            $graphics.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::SingleBitPerPixelGridFit
+            $graphics.DrawString($text, $font, $textBrush, $rect, $format)
+        }
+        finally {
+            $format.Dispose()
+            $font.Dispose()
+            $textBrush.Dispose()
+        }
+
+        # Convert bitmap to icon
+        $hIcon = $bitmap.GetHicon()
+        $tempIcon = $null
+        try {
+            $tempIcon = [System.Drawing.Icon]::FromHandle($hIcon)
+            $icon = [System.Drawing.Icon]$tempIcon.Clone()
+        }
+        finally {
+            [void][IconHelper]::DestroyIcon($hIcon)
+            if ($tempIcon) { $tempIcon.Dispose() }
+        }
+
+        return $icon
+    }
+    finally {
+        if ($graphics) { $graphics.Dispose() }
+        if ($bitmap) { $bitmap.Dispose() }
+    }
+}
+
+function Update-TrayIcon {
+    # Skip if tray icon not initialized yet
+    if (-not $script:trayIcon) { return }
+    if (-not $script:lastBatteryStatus) { return }
+
+    # Check if anything changed since last render
+    $currentCharge = $script:lastBatteryStatus.BatteryCharge
+    $currentOnAC = $script:lastBatteryStatus.OnAC
+    $currentMode = $script:currentMode
+
+    if ($script:lastRenderedBatteryStatus -and
+        $script:lastRenderedBatteryStatus.BatteryCharge -eq $currentCharge -and
+        $script:lastRenderedBatteryStatus.OnAC -eq $currentOnAC -and
+        $script:lastRenderedMode -eq $currentMode) {
+        return  # Nothing changed, skip update
+    }
+
+    $icon = Draw-BatteryIcon `
+        -BatteryPercent $currentCharge `
+        -OnAC $currentOnAC `
+        -Mode $currentMode
+
+    # Assign new icon and dispose old one
+    $oldIcon = $script:trayIcon.Icon
+    $script:trayIcon.Icon = $icon
+    if ($oldIcon) { $oldIcon.Dispose() }
+
+    $powerText = if ($currentOnAC) { "On AC" } else { "On Battery" }
+    $script:trayIcon.Text = "$currentCharge% - $powerText`nMode: $currentMode"
+
+    # Store the rendered state
+    $script:lastRenderedBatteryStatus = @{
+        BatteryCharge = $currentCharge
+        OnAC = $currentOnAC
+    }
+    $script:lastRenderedMode = $currentMode
+}
+
+function Confirm-ACState {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [bool]$ExpectedOnAC
+    )
+
+    $pollIntervalMs = 100
+    $maxIterations = [math]::Ceiling(($ConfirmationTimeoutSeconds * 1000) / $pollIntervalMs)
+
+    for ($i = 0; $i -lt $maxIterations; $i++) {
+        Start-Sleep -Milliseconds $pollIntervalMs
+        $status = Get-BatteryStatus
+        if ($status.OnAC -eq $ExpectedOnAC) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
 function Invoke-AutoCharging {
     param (
-        [int]$Charge,
-        [bool]$IsCharging,
+        [int]$BatteryCharge,
+        [bool]$OnAC,
         [int]$MinLevel,
         [int]$MaxLevel
     )
 
-    # Battery LOW and NOT charging → Need to START charging
-    if ($Charge -lt $MinLevel -and -not $IsCharging) {
-        Write-Host "Battery low! Attempting to turn ON smart plug..." -ForegroundColor Yellow
+    # Battery LOW and NOT on AC → Need to START charging
+    if ($BatteryCharge -le $MinLevel -and -not $OnAC) {
+        Write-Host "Battery low ($BatteryCharge%)! Attempting to turn ON smart plug" -ForegroundColor Yellow
         $plugSuccess = Set-TasmotaPlug -State "On"
         if (-not $plugSuccess) {
-            SendWindowsNotification -Title "Battery Low: $Charge%" -Message "Smart plug unreachable. Please plug in the charger manually!"
+            SendWindowsNotification -Title "Battery Low: $BatteryCharge%" -Message "Smart plug unreachable. Please plug in the charger manually!"
         }
         else {
-            Write-Host "Smart plug activated - charging should start automatically." -ForegroundColor Cyan
-            # Wait and verify charging started
-            Start-Sleep -Milliseconds $ConfirmationDelayMilliseconds
-            $newStatus = Get-BatteryStatus
-            if (-not $newStatus.IsCharging) {
-                SendWindowsNotification -Title "Charging Not Started" -Message "Smart plug responded but charging didn't start. Please check the charger connection!"
+            $confirmed = Confirm-ACState -ExpectedOnAC $true
+            if (-not $confirmed) {
+                SendWindowsNotification -Title "AC Power Not Detected" -Message "Smart plug responded but AC not detected. Please check the charger connection!"
             }
         }
     }
-    # Battery HIGH and CHARGING → Need to STOP charging
-    elseif ($Charge -gt $MaxLevel -and $IsCharging) {
-        Write-Host "Battery sufficiently charged! Attempting to turn OFF smart plug..." -ForegroundColor Yellow
+    # Battery HIGH and ON AC → Need to STOP charging
+    elseif ($BatteryCharge -ge $MaxLevel -and $OnAC) {
+        Write-Host "Battery sufficiently charged ($BatteryCharge%)! Attempting to turn OFF smart plug" -ForegroundColor Yellow
         $plugSuccess = Set-TasmotaPlug -State "Off"
         if (-not $plugSuccess) {
-            SendWindowsNotification -Title "Battery High: $Charge%" -Message "Smart plug unreachable. Please unplug the charger manually!"
+            SendWindowsNotification -Title "Battery High: $BatteryCharge%" -Message "Smart plug unreachable. Please unplug the charger manually!"
         }
         else {
-            Write-Host "Smart plug deactivated - charging should stop automatically." -ForegroundColor Cyan
-            # Wait and verify charging stopped
-            Start-Sleep -Milliseconds $ConfirmationDelayMilliseconds
-            $newStatus = Get-BatteryStatus
-            if ($newStatus.IsCharging) {
-                SendWindowsNotification -Title "Charging Not Stopped" -Message "Smart plug responded but charging continues. Please check the charger connection!"
+            $confirmed = Confirm-ACState -ExpectedOnAC $false
+            if (-not $confirmed) {
+                SendWindowsNotification -Title "Still On AC Power" -Message "Smart plug responded but still on AC. Please check the charger connection!"
             }
         }
     }
     else {
-        Write-Host "Range $MinLevel%-$MaxLevel%. No action needed." -ForegroundColor Gray
+        Write-Host "No action needed" -ForegroundColor Gray
     }
 }
 
@@ -290,18 +483,18 @@ function Invoke-ManualChargerControl {
     param (
         [ValidateSet("On", "Off")]
         [string]$DesiredState,
-        [bool]$IsCharging
+        [bool]$OnAC
     )
 
     # Check if action is needed
-    $needsAction = ($DesiredState -eq "On" -and -not $IsCharging) -or ($DesiredState -eq "Off" -and $IsCharging)
+    $needsAction = ($DesiredState -eq "On" -and -not $OnAC) -or ($DesiredState -eq "Off" -and $OnAC)
 
     if (-not $needsAction) {
-        Write-Host "Manual mode: Charger already in desired state ($DesiredState)." -ForegroundColor Gray
+        Write-Host "No action needed" -ForegroundColor Gray
         return
     }
 
-    Write-Host "Manual mode: Enforcing charger $DesiredState..." -ForegroundColor Yellow
+    Write-Host "Manual mode: Enforcing charger $DesiredState" -ForegroundColor Yellow
     $plugSuccess = Set-TasmotaPlug -State $DesiredState
 
     if (-not $plugSuccess) {
@@ -313,43 +506,41 @@ function Invoke-ManualChargerControl {
         }
     }
     else {
-        Write-Host "Smart plug $DesiredState command sent successfully." -ForegroundColor Cyan
-        # Wait and verify state changed
-        Start-Sleep -Milliseconds $ConfirmationDelayMilliseconds
-        $newStatus = Get-BatteryStatus
-        $stateCorrect = ($DesiredState -eq "On" -and $newStatus.IsCharging) -or ($DesiredState -eq "Off" -and -not $newStatus.IsCharging)
-        if (-not $stateCorrect) {
+        $expectedOnAC = ($DesiredState -eq "On")
+        $confirmed = Confirm-ACState -ExpectedOnAC $expectedOnAC
+        if (-not $confirmed) {
             if ($DesiredState -eq "On") {
-                SendWindowsNotification -Title "Charging Not Started" -Message "Smart plug responded but charging didn't start. Please check the charger connection!"
+                SendWindowsNotification -Title "AC Not Detected" -Message "Smart plug responded but AC not detected. Please check the charger connection!"
             }
             else {
-                SendWindowsNotification -Title "Charging Not Stopped" -Message "Smart plug responded but charging continues. Please check the charger connection!"
+                SendWindowsNotification -Title "Still On AC" -Message "Smart plug responded but still on AC. Please check the charger connection!"
             }
         }
     }
 }
 
-function Check-Battery {
+function Invoke-BatteryCheck {
     $batteryStatus = Get-BatteryStatus
-    $estimatedCharge = $batteryStatus.Charge
-    $isCharging = $batteryStatus.IsCharging
+    $batteryCharge = $batteryStatus.BatteryCharge
+    $onAC = $batteryStatus.OnAC
 
-    Write-Host "$(Get-Date -Format 'HH:mm:ss') - Battery: $estimatedCharge% | Charging: $isCharging | Mode: $($script:currentMode)"
+    $powerSource = if ($onAC) { "AC" } else { "Battery" }
+    Write-Host "$(Get-Date -Format 'HH:mm:ss') - Battery: $batteryCharge% | Power: $powerSource | Mode: $script:currentMode"
 
     switch ($script:currentMode) {
         "Auto" {
-            Invoke-AutoCharging -Charge $estimatedCharge -IsCharging $isCharging `
+            Invoke-AutoCharging -BatteryCharge $batteryCharge -OnAC $onAC `
                 -MinLevel $MinBatteryLevel -MaxLevel $MaxBatteryLevel
         }
         "AutoHigh" {
-            Invoke-AutoCharging -Charge $estimatedCharge -IsCharging $isCharging `
+            Invoke-AutoCharging -BatteryCharge $batteryCharge -OnAC $onAC `
                 -MinLevel $MinBatteryLevelHigh -MaxLevel $MaxBatteryLevelHigh
         }
         "ChargerOn" {
-            Invoke-ManualChargerControl -DesiredState "On" -IsCharging $isCharging
+            Invoke-ManualChargerControl -DesiredState "On" -OnAC $onAC
         }
         "ChargerOff" {
-            Invoke-ManualChargerControl -DesiredState "Off" -IsCharging $isCharging
+            Invoke-ManualChargerControl -DesiredState "Off" -OnAC $onAC
         }
     }
 }
@@ -378,24 +569,6 @@ function Initialize-TrayIcon {
     # Create NotifyIcon
     $script:trayIcon = New-Object System.Windows.Forms.NotifyIcon
 
-    # Try to get a battery/power icon from system DLLs
-    try {
-        $icon = [IconExtractor]::Extract("$env:SystemRoot\System32\powercpl.dll", 2)
-        if ($icon) {
-            $script:trayIcon.Icon = $icon
-        }
-        else {
-            # Last resort: use PowerShell icon
-            $script:trayIcon.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon((Get-Process -Id $PID).Path)
-        }
-    }
-    catch {
-        # Fallback to PowerShell icon
-        $script:trayIcon.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon((Get-Process -Id $PID).Path)
-    }
-
-    $script:trayIcon.Text = "Battery Range"
-
     # Create context menu
     $contextMenu = New-Object System.Windows.Forms.ContextMenuStrip
 
@@ -409,7 +582,7 @@ function Initialize-TrayIcon {
 
     # Auto High menu item
     $script:menuAutoHigh = New-Object System.Windows.Forms.ToolStripMenuItem
-    $script:menuAutoHigh.Text = "Auto high"
+    $script:menuAutoHigh.Text = "Auto High"
     $script:menuAutoHigh.Checked = $false
     $script:menuAutoHigh.Add_Click({
         Set-Mode "AutoHigh"
@@ -454,11 +627,14 @@ function Initialize-TrayIcon {
 
     # Event: Exit clicked
     $exitMenuItem.Add_Click({
-        Write-Host "Exiting - Enabling charging before shutdown..." -ForegroundColor Yellow
+        Write-Host "Exiting - Enabling charging before shutdown" -ForegroundColor Yellow
         Set-TasmotaPlug -State "On"
 
         [System.Windows.Forms.Application]::Exit()
     })
+
+    # Set initial dynamic icon based on current battery status
+    Update-TrayIcon
 
     # Show the tray icon
     $script:trayIcon.Visible = $true
@@ -469,7 +645,7 @@ function Initialize-Timer {
     $script:timer.Interval = $CheckIntervalSeconds * 1000
 
     $script:timer.Add_Tick({
-        Check-Battery
+        Invoke-BatteryCheck
     })
 }
 
@@ -480,18 +656,23 @@ function Restart-Timer {
     $script:timer.Stop()
 
     # Run initial battery check
-    Check-Battery
+    Invoke-BatteryCheck
 
     # Start the timer
     $script:timer.Start()
 }
 
 # Main execution
+$script:timer = $null
+$script:trayIcon = $null
 try {
-    Write-Host "Starting Battery Range..." -ForegroundColor Cyan
-    Write-Host "Right-click the tray icon for options." -ForegroundColor Cyan
+    Write-Host "--- Battery Range ---" -ForegroundColor Cyan
+    Write-Host "Right-click the tray icon for options" -ForegroundColor Cyan
     Write-Host "Modes: Auto ($MinBatteryLevel%-$MaxBatteryLevel%), Auto High ($MinBatteryLevelHigh%-$MaxBatteryLevelHigh%), Manual On/Off" -ForegroundColor Cyan
 
+    # Global state - Modes: "Auto", "AutoHigh", "ChargerOn", "ChargerOff"
+    $script:currentMode = "Auto"
+    
     # Initialize and start timer
     Initialize-Timer
     Restart-Timer
@@ -510,16 +691,16 @@ finally {
     }
     if ($script:trayIcon) {
         $script:trayIcon.Visible = $false
+        if ($script:trayIcon.Icon) { $script:trayIcon.Icon.Dispose() }
+        if ($script:trayIcon.ContextMenuStrip) { $script:trayIcon.ContextMenuStrip.Dispose() }
         $script:trayIcon.Dispose()
     }
-
-    # Release the mutex
-    if ($script:hasHandle -and $script:mutex) {
-        $script:mutex.ReleaseMutex()
-    }
     if ($script:mutex) {
+        if ($script:hasHandle) {
+            $script:mutex.ReleaseMutex()
+        }
         $script:mutex.Dispose()
     }
 
-    Write-Host "Battery Range stopped." -ForegroundColor Yellow
+    Write-Host "Battery Range stopped" -ForegroundColor Yellow
 }
