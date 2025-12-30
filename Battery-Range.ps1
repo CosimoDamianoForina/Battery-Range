@@ -55,6 +55,14 @@ param (
     [Parameter(HelpMessage = "IP address of the Tasmota smart plug")]
     [string]$TasmotaPlugIP = "192.168.137.101",
 
+    [Parameter(HelpMessage = "Timeout in seconds for the Tasmota smart plug")]
+    [ValidateRange(1, 5)]
+    [int]$TasmotaTimeoutSeconds = 2,
+
+    [Parameter(HelpMessage = "Delay in milliseconds before confirming the status")]
+    [ValidateRange(100, 5000)]
+    [int]$ConfirmationDelayMilliseconds = 1000,
+
     [Parameter(HelpMessage = "Battery check interval in seconds")]
     [ValidateRange(10, 300)]
     [int]$CheckIntervalSeconds = 30,
@@ -140,8 +148,13 @@ public class IconExtractor {
         IntPtr hIcon = ExtractIcon(IntPtr.Zero, filePath, iconIndex);
         if (hIcon == IntPtr.Zero) return null;
 
-        Icon icon = Icon.FromHandle(hIcon);
-        return (Icon)icon.Clone();
+        try {
+            Icon icon = Icon.FromHandle(hIcon);
+            return (Icon)icon.Clone();
+        }
+        finally {
+            DestroyIcon(hIcon);
+        }
     }
 }
 "@ -ReferencedAssemblies System.Drawing
@@ -158,21 +171,51 @@ function SendWindowsNotification {
         [string]$Message
     )
 
-    $ErrorActionPreference = "Stop"
-    [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
-    $template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
-    $toastXml = [xml] $template.GetXml()
-    $textNodes = $toastXml.GetElementsByTagName("text")
-    $textNodes.Item(0).AppendChild($toastXml.CreateTextNode($Title)) > $null
-    $textNodes.Item(1).AppendChild($toastXml.CreateTextNode($Message)) > $null
-    $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
-    $xml.LoadXml($toastXml.OuterXml)
-    $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
-    $toast.Tag = "BatteryRangeNotification"
-    $toast.Group = $toast.Tag
-    $toast.ExpirationTime = [DateTimeOffset]::Now.AddSeconds($CheckIntervalSeconds)
-    $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("Battery Range")
-    $notifier.Show($toast)
+    try {
+        # WinRT toast APIs can throw if not supported / app not registered for toasts.
+        [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+
+        $template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent(
+            [Windows.UI.Notifications.ToastTemplateType]::ToastText02
+        )
+
+        $toastXml = [xml]$template.GetXml()
+        $textNodes = $toastXml.GetElementsByTagName("text")
+        $textNodes.Item(0).AppendChild($toastXml.CreateTextNode($Title)) | Out-Null
+        $textNodes.Item(1).AppendChild($toastXml.CreateTextNode($Message)) | Out-Null
+
+        $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+        $xml.LoadXml($toastXml.OuterXml)
+
+        $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+        $toast.Tag = "BatteryRangeNotification"
+        $toast.Group = $toast.Tag
+        $toast.ExpirationTime = [DateTimeOffset]::Now.AddSeconds($CheckIntervalSeconds)
+
+        # Note: On some systems toasts require proper desktop app registration/shortcut.
+        $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("Battery Range")
+        $notifier.Show($toast)
+    }
+    catch {
+        # Log to console
+        Write-Warning "$Title - $Message"
+    }
+}
+
+function Get-BatteryStatus {
+    $battery = Get-CimInstance -ClassName Win32_Battery
+    $estimatedCharge = $battery.estimatedChargeRemaining
+    $batteryStatus = $battery.BatteryStatus
+
+    # 1=Discharging, 2=Unknown/AC, 6=Charging, 7=ChargingHigh, 8=ChargingLow, 9=ChargingCritical
+    # Note: Status 2 often means "Plugged in, not charging" (e.g. at 100% or threshold limit)
+    $chargingStatuses = @(2, 6, 7, 8, 9)
+    $isCharging = $batteryStatus -in $chargingStatuses
+
+    return @{
+        Charge     = $estimatedCharge
+        IsCharging = $isCharging
+    }
 }
 
 function Set-TasmotaPlug {
@@ -186,7 +229,7 @@ function Set-TasmotaPlug {
     $url = "http://$TasmotaPlugIP/cm?cmnd=Power%20$State"
 
     try {
-        $response = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 2
+        $response = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec $TasmotaTimeoutSeconds
         Write-Host "Smart plug turned $State successfully. Response: $($response.POWER)" -ForegroundColor Green
         return $true
     }
@@ -199,25 +242,30 @@ function Set-TasmotaPlug {
 function Invoke-AutoCharging {
     param (
         [int]$Charge,
-        [int]$Status,
-        [array]$ChargingStatuses,
+        [bool]$IsCharging,
         [int]$MinLevel,
         [int]$MaxLevel
     )
 
     # Battery LOW and NOT charging → Need to START charging
-    if ($Charge -lt $MinLevel -and $Status -eq 1) {
+    if ($Charge -lt $MinLevel -and -not $IsCharging) {
         Write-Host "Battery low! Attempting to turn ON smart plug..." -ForegroundColor Yellow
         $plugSuccess = Set-TasmotaPlug -State "On"
         if (-not $plugSuccess) {
-             SendWindowsNotification -Title "Battery Low: $Charge%" -Message "Smart plug unreachable. Please plug in the charger manually!"
+            SendWindowsNotification -Title "Battery Low: $Charge%" -Message "Smart plug unreachable. Please plug in the charger manually!"
         }
         else {
             Write-Host "Smart plug activated - charging should start automatically." -ForegroundColor Cyan
+            # Wait and verify charging started
+            Start-Sleep -Milliseconds $ConfirmationDelayMilliseconds
+            $newStatus = Get-BatteryStatus
+            if (-not $newStatus.IsCharging) {
+                SendWindowsNotification -Title "Charging Not Started" -Message "Smart plug responded but charging didn't start. Please check the charger connection!"
+            }
         }
     }
     # Battery HIGH and CHARGING → Need to STOP charging
-    elseif ($Charge -gt $MaxLevel -and $Status -in $ChargingStatuses) {
+    elseif ($Charge -gt $MaxLevel -and $IsCharging) {
         Write-Host "Battery sufficiently charged! Attempting to turn OFF smart plug..." -ForegroundColor Yellow
         $plugSuccess = Set-TasmotaPlug -State "Off"
         if (-not $plugSuccess) {
@@ -225,6 +273,12 @@ function Invoke-AutoCharging {
         }
         else {
             Write-Host "Smart plug deactivated - charging should stop automatically." -ForegroundColor Cyan
+            # Wait and verify charging stopped
+            Start-Sleep -Milliseconds $ConfirmationDelayMilliseconds
+            $newStatus = Get-BatteryStatus
+            if ($newStatus.IsCharging) {
+                SendWindowsNotification -Title "Charging Not Stopped" -Message "Smart plug responded but charging continues. Please check the charger connection!"
+            }
         }
     }
     else {
@@ -235,8 +289,17 @@ function Invoke-AutoCharging {
 function Invoke-ManualChargerControl {
     param (
         [ValidateSet("On", "Off")]
-        [string]$DesiredState
+        [string]$DesiredState,
+        [bool]$IsCharging
     )
+
+    # Check if action is needed
+    $needsAction = ($DesiredState -eq "On" -and -not $IsCharging) -or ($DesiredState -eq "Off" -and $IsCharging)
+
+    if (-not $needsAction) {
+        Write-Host "Manual mode: Charger already in desired state ($DesiredState)." -ForegroundColor Gray
+        return
+    }
 
     Write-Host "Manual mode: Enforcing charger $DesiredState..." -ForegroundColor Yellow
     $plugSuccess = Set-TasmotaPlug -State $DesiredState
@@ -251,32 +314,42 @@ function Invoke-ManualChargerControl {
     }
     else {
         Write-Host "Smart plug $DesiredState command sent successfully." -ForegroundColor Cyan
+        # Wait and verify state changed
+        Start-Sleep -Milliseconds $ConfirmationDelayMilliseconds
+        $newStatus = Get-BatteryStatus
+        $stateCorrect = ($DesiredState -eq "On" -and $newStatus.IsCharging) -or ($DesiredState -eq "Off" -and -not $newStatus.IsCharging)
+        if (-not $stateCorrect) {
+            if ($DesiredState -eq "On") {
+                SendWindowsNotification -Title "Charging Not Started" -Message "Smart plug responded but charging didn't start. Please check the charger connection!"
+            }
+            else {
+                SendWindowsNotification -Title "Charging Not Stopped" -Message "Smart plug responded but charging continues. Please check the charger connection!"
+            }
+        }
     }
 }
 
 function Check-Battery {
-    $battery = Get-WmiObject win32_battery
-    $estimatedCharge = $battery.estimatedChargeRemaining
-    $batteryStatus = $battery.BatteryStatus
-    $chargingStatuses = @(2, 6)  # 2 = AC connected, 6 = Charging
-    $isCharging = $batteryStatus -in $chargingStatuses
+    $batteryStatus = Get-BatteryStatus
+    $estimatedCharge = $batteryStatus.Charge
+    $isCharging = $batteryStatus.IsCharging
 
     Write-Host "$(Get-Date -Format 'HH:mm:ss') - Battery: $estimatedCharge% | Charging: $isCharging | Mode: $($script:currentMode)"
 
     switch ($script:currentMode) {
         "Auto" {
-            Invoke-AutoCharging -Charge $estimatedCharge -Status $batteryStatus `
-                -ChargingStatuses $chargingStatuses -MinLevel $MinBatteryLevel -MaxLevel $MaxBatteryLevel
+            Invoke-AutoCharging -Charge $estimatedCharge -IsCharging $isCharging `
+                -MinLevel $MinBatteryLevel -MaxLevel $MaxBatteryLevel
         }
         "AutoHigh" {
-            Invoke-AutoCharging -Charge $estimatedCharge -Status $batteryStatus `
-                -ChargingStatuses $chargingStatuses -MinLevel $MinBatteryLevelHigh -MaxLevel $MaxBatteryLevelHigh
+            Invoke-AutoCharging -Charge $estimatedCharge -IsCharging $isCharging `
+                -MinLevel $MinBatteryLevelHigh -MaxLevel $MaxBatteryLevelHigh
         }
         "ChargerOn" {
-            Invoke-ManualChargerControl -DesiredState "On"
+            Invoke-ManualChargerControl -DesiredState "On" -IsCharging $isCharging
         }
         "ChargerOff" {
-            Invoke-ManualChargerControl -DesiredState "Off"
+            Invoke-ManualChargerControl -DesiredState "Off" -IsCharging $isCharging
         }
     }
 }
@@ -382,12 +455,6 @@ function Initialize-TrayIcon {
     # Event: Exit clicked
     $exitMenuItem.Add_Click({
         Write-Host "Exiting - Enabling charging before shutdown..." -ForegroundColor Yellow
-
-        $script:timer.Stop()
-        $script:timer.Dispose()
-        $script:trayIcon.Visible = $false
-        $script:trayIcon.Dispose()
-
         Set-TasmotaPlug -State "On"
 
         [System.Windows.Forms.Application]::Exit()
@@ -407,6 +474,8 @@ function Initialize-Timer {
 }
 
 function Restart-Timer {
+    if (-not $script:timer) { return }
+
     # Stop the timer
     $script:timer.Stop()
 
@@ -423,12 +492,12 @@ try {
     Write-Host "Right-click the tray icon for options." -ForegroundColor Cyan
     Write-Host "Modes: Auto ($MinBatteryLevel%-$MaxBatteryLevel%), Auto High ($MinBatteryLevelHigh%-$MaxBatteryLevelHigh%), Manual On/Off" -ForegroundColor Cyan
 
-    # Initialize tray icon
-    Initialize-TrayIcon
-
     # Initialize and start timer
     Initialize-Timer
     Restart-Timer
+
+    # Initialize tray icon
+    Initialize-TrayIcon
 
     # Run the Windows Forms application message loop
     [System.Windows.Forms.Application]::Run()
