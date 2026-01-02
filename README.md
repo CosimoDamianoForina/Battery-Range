@@ -14,6 +14,7 @@ Lithium-ion batteries degrade faster when kept at 100% charge or frequently deep
 
 - **Automatic Battery Management** - Maintains battery within configurable SoC ranges
 - **Dual Range Profiles** - Normal (35-45%) and High (70-80%) modes for different needs
+- **One-Time Target** - Charge/discharge to a specific target once
 - **Manual Override** - Force charger on/off when needed
 - **System Tray Integration** - Unobtrusive operation with right-click context menu
 - **Failure Notifications** - Alerts you to manually plug/unplug if smart plug is unreachable
@@ -62,6 +63,7 @@ Lithium-ion batteries degrade faster when kept at 100% charge or frequently deep
 |------|-------------|
 | **Auto** | Maintains battery between `MinBatteryLevel` and `MaxBatteryLevel` (default: 35-45%) |
 | **Auto High** | Maintains battery between `MinBatteryLevelHigh` and `MaxBatteryLevelHigh` (default: 70-80%) |
+| **To X% Once...** | Brings the battery to a specific target and then returns to the previous mode |
 | **Charger On** | Forces charger on continuously (useful before travel) |
 | **Charger Off** | Forces charger off continuously |
 
@@ -76,6 +78,7 @@ The tray icon provides at-a-glance status:
 | **Text color: White** | Laptop is on battery |
 | **Border: Blue** | Auto mode |
 | **Border: Magenta** | Auto High mode |
+| **Border: Golden** | To X% Once mode |
 | **Border: Green** | Charger On mode |
 | **Border: Orange** | Charger Off mode |
 
@@ -177,4 +180,5 @@ Contributions are welcome! Please open an issue or submit a pull request.
 ## Acknowledgments
 
 - [Tasmota](https://github.com/arendst/tasmota) - Open source firmware for ESP8266/ESP32 devices
+
 

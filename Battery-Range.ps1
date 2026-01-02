@@ -10,6 +10,7 @@
     Features:
     - Automatic battery management within configurable SoC ranges
     - Normal and High SoC range profiles
+    - One-time charge/discharge to specific target
     - Manual charger control override
     - System tray integration with context menu
     - Failure notifications with manual action prompts
@@ -291,6 +292,21 @@ function Set-TasmotaPlug {
     }
 }
 
+function Get-ModeDisplayName {
+    param (
+        [string]$Mode
+    )
+
+    switch ($Mode) {
+        "Auto"         { "Auto" }
+        "AutoHigh"     { "Auto High" }
+        "ChargerOn"    { "Charger On" }
+        "ChargerOff"   { "Charger Off" }
+        "ToTargetOnce" { "To $($script:targetSoC)% Once" }
+        default        { $Mode }
+    }
+}
+
 function Draw-BatteryIcon {
     param (
         [int]$BatteryPercent,
@@ -308,11 +324,12 @@ function Draw-BatteryIcon {
 
         # Mode-specific border colors
         $borderColor = switch ($Mode) {
-            "Auto"       { [System.Drawing.Color]::DodgerBlue }
-            "AutoHigh"   { [System.Drawing.Color]::Magenta }
-            "ChargerOn"  { [System.Drawing.Color]::LimeGreen }
-            "ChargerOff" { [System.Drawing.Color]::OrangeRed }
-            default      { [System.Drawing.Color]::Gray }
+            "Auto"         { [System.Drawing.Color]::DodgerBlue }
+            "AutoHigh"     { [System.Drawing.Color]::Magenta }
+            "ChargerOn"    { [System.Drawing.Color]::LimeGreen }
+            "ChargerOff"   { [System.Drawing.Color]::OrangeRed }
+            "ToTargetOnce" { [System.Drawing.Color]::Gold }
+            default        { [System.Drawing.Color]::Gray }
         }
 
         # Fill with black background
@@ -407,7 +424,9 @@ function Update-TrayIcon {
     if ($oldIcon) { $oldIcon.Dispose() }
 
     $powerText = if ($currentOnAC) { "On AC" } else { "On Battery" }
-    $script:trayIcon.Text = "$currentCharge% - $powerText`nMode: $currentMode"
+    $modeDisplay = Get-ModeDisplayName -Mode $currentMode
+
+    $script:trayIcon.Text = "$currentCharge% - $powerText`nMode: $modeDisplay"
 
     # Store the rendered state
     $script:lastRenderedBatteryStatus = @{
@@ -519,13 +538,37 @@ function Invoke-ManualChargerControl {
     }
 }
 
+function Invoke-ToTargetOnce {
+    param (
+        [int]$BatteryCharge,
+        [bool]$OnAC,
+        [int]$TargetSoC
+    )
+
+    if ($BatteryCharge -lt $TargetSoC) {
+        # Below target - need to charge
+        Invoke-ManualChargerControl -DesiredState "On" -OnAC $OnAC
+    }
+    elseif ($BatteryCharge -gt $TargetSoC) {
+        # Above target - need to discharge
+        Invoke-ManualChargerControl -DesiredState "Off" -OnAC $OnAC
+    }
+    else {
+        # Exactly at target - done!
+        Write-Host "Target $TargetSoC% reached! Restoring previous mode: $($script:previousMode)" -ForegroundColor Green
+        SendWindowsNotification -Title "Target Reached" -Message "Battery at $TargetSoC%. Returning to $(Get-ModeDisplayName -Mode $script:previousMode) mode."
+        Set-Mode -NewMode $script:previousMode
+    }
+}
+
 function Invoke-BatteryCheck {
     $batteryStatus = Get-BatteryStatus
     $batteryCharge = $batteryStatus.BatteryCharge
     $onAC = $batteryStatus.OnAC
 
     $powerSource = if ($onAC) { "AC" } else { "Battery" }
-    Write-Host "$(Get-Date -Format 'HH:mm:ss') - Battery: $batteryCharge% | Power: $powerSource | Mode: $script:currentMode"
+    $modeDisplay = Get-ModeDisplayName -Mode $script:currentMode
+    Write-Host "$(Get-Date -Format 'HH:mm:ss') - Battery: $batteryCharge% | Power: $powerSource | Mode: $modeDisplay"
 
     switch ($script:currentMode) {
         "Auto" {
@@ -542,14 +585,32 @@ function Invoke-BatteryCheck {
         "ChargerOff" {
             Invoke-ManualChargerControl -DesiredState "Off" -OnAC $onAC
         }
+        "ToTargetOnce" {
+            Invoke-ToTargetOnce -BatteryCharge $batteryCharge -OnAC $onAC -TargetSoC $script:targetSoC
+        }
     }
 }
 
 function Set-Mode {
     param (
-        [ValidateSet("Auto", "AutoHigh", "ChargerOn", "ChargerOff")]
-        [string]$NewMode
+        [ValidateSet("Auto", "AutoHigh", "ChargerOn", "ChargerOff", "ToTargetOnce")]
+        [string]$NewMode,
+        [int]$TargetSoC = 50
     )
+
+    # Store previous mode if switching to ToTargetOnce (but not if already in ToTargetOnce)
+    if ($NewMode -eq "ToTargetOnce") {
+        if ($script:currentMode -ne "ToTargetOnce") {
+            $script:previousMode = $script:currentMode
+        }
+        $script:targetSoC = $TargetSoC
+        # Update menu text to show actual target
+        $script:menuToTargetOnce.Text = "To $TargetSoC% Once"
+    }
+    else {
+        # Reset menu text when leaving ToTargetOnce mode
+        $script:menuToTargetOnce.Text = "To X% Once..."
+    }
 
     $script:currentMode = $NewMode
 
@@ -558,11 +619,73 @@ function Set-Mode {
     $script:menuAutoHigh.Checked = ($NewMode -eq "AutoHigh")
     $script:menuChargerOn.Checked = ($NewMode -eq "ChargerOn")
     $script:menuChargerOff.Checked = ($NewMode -eq "ChargerOff")
+    $script:menuToTargetOnce.Checked = ($NewMode -eq "ToTargetOnce")
 
-    Write-Host "Mode changed to: $NewMode" -ForegroundColor Green
+    $modeDisplay = Get-ModeDisplayName -Mode $NewMode
+    Write-Host "Mode changed to: $modeDisplay" -ForegroundColor Green
 
     # Restart timer to apply changes immediately
     Restart-Timer
+}
+
+function Show-TargetSoCDialog {
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Battery Range"
+    $form.Size = New-Object System.Drawing.Size(280, 150)
+    $form.StartPosition = "CenterScreen"
+    $form.FormBorderStyle = "FixedDialog"
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.TopMost = $true
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Location = New-Object System.Drawing.Point(15, 15)
+    $label.Size = New-Object System.Drawing.Size(240, 20)
+    $label.Text = "Enter target battery percentage:"
+    $form.Controls.Add($label)
+
+    $numericUpDown = New-Object System.Windows.Forms.NumericUpDown
+    $numericUpDown.Location = New-Object System.Drawing.Point(15, 40)
+    $numericUpDown.Size = New-Object System.Drawing.Size(80, 25)
+    $numericUpDown.Minimum = 10
+    $numericUpDown.Maximum = 100
+    # Default to current battery level or 50
+    $defaultValue = if ($script:lastBatteryStatus) { $script:lastBatteryStatus.BatteryCharge } else { 50 }
+    $numericUpDown.Value = [Math]::Max(10, [Math]::Min(100, $defaultValue))
+    $form.Controls.Add($numericUpDown)
+
+    $percentLabel = New-Object System.Windows.Forms.Label
+    $percentLabel.Location = New-Object System.Drawing.Point(100, 42)
+    $percentLabel.Size = New-Object System.Drawing.Size(30, 20)
+    $percentLabel.Text = "%"
+    $form.Controls.Add($percentLabel)
+
+    $okButton = New-Object System.Windows.Forms.Button
+    $okButton.Location = New-Object System.Drawing.Point(70, 75)
+    $okButton.Size = New-Object System.Drawing.Size(75, 25)
+    $okButton.Text = "OK"
+    $okButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $form.AcceptButton = $okButton
+    $form.Controls.Add($okButton)
+
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Location = New-Object System.Drawing.Point(155, 75)
+    $cancelButton.Size = New-Object System.Drawing.Size(75, 25)
+    $cancelButton.Text = "Cancel"
+    $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $form.CancelButton = $cancelButton
+    $form.Controls.Add($cancelButton)
+
+    # Focus the numeric input
+    $form.Add_Shown({ $numericUpDown.Select() })
+
+    $result = $form.ShowDialog()
+    $form.Dispose()
+
+    if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+        return [int]$numericUpDown.Value
+    }
+    return $null
 }
 
 function Initialize-TrayIcon {
@@ -574,7 +697,7 @@ function Initialize-TrayIcon {
 
     # Auto menu item
     $script:menuAuto = New-Object System.Windows.Forms.ToolStripMenuItem
-    $script:menuAuto.Text = "Auto"
+    $script:menuAuto.Text = "Auto ($MinBatteryLevel%-$MaxBatteryLevel%)"
     $script:menuAuto.Checked = $true
     $script:menuAuto.Add_Click({
         Set-Mode "Auto"
@@ -582,7 +705,7 @@ function Initialize-TrayIcon {
 
     # Auto High menu item
     $script:menuAutoHigh = New-Object System.Windows.Forms.ToolStripMenuItem
-    $script:menuAutoHigh.Text = "Auto High"
+    $script:menuAutoHigh.Text = "Auto High ($MinBatteryLevelHigh%-$MaxBatteryLevelHigh%)"
     $script:menuAutoHigh.Checked = $false
     $script:menuAutoHigh.Add_Click({
         Set-Mode "AutoHigh"
@@ -590,6 +713,20 @@ function Initialize-TrayIcon {
 
     # Separator 1
     $separator1 = New-Object System.Windows.Forms.ToolStripSeparator
+
+    # To X% Once menu item
+    $script:menuToTargetOnce = New-Object System.Windows.Forms.ToolStripMenuItem
+    $script:menuToTargetOnce.Text = "To X% Once..."
+    $script:menuToTargetOnce.Checked = $false
+    $script:menuToTargetOnce.Add_Click({
+        $targetSoC = Show-TargetSoCDialog
+        if ($null -ne $targetSoC) {
+            Set-Mode -NewMode "ToTargetOnce" -TargetSoC $targetSoC
+        }
+    })
+
+    # Separator 2
+    $separator2 = New-Object System.Windows.Forms.ToolStripSeparator
 
     # Charger On menu item
     $script:menuChargerOn = New-Object System.Windows.Forms.ToolStripMenuItem
@@ -607,8 +744,8 @@ function Initialize-TrayIcon {
         Set-Mode "ChargerOff"
     })
 
-    # Separator 2
-    $separator2 = New-Object System.Windows.Forms.ToolStripSeparator
+    # Separator 3
+    $separator3 = New-Object System.Windows.Forms.ToolStripSeparator
 
     # Exit menu item
     $exitMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem
@@ -618,9 +755,11 @@ function Initialize-TrayIcon {
     $contextMenu.Items.Add($script:menuAuto) | Out-Null
     $contextMenu.Items.Add($script:menuAutoHigh) | Out-Null
     $contextMenu.Items.Add($separator1) | Out-Null
+    $contextMenu.Items.Add($script:menuToTargetOnce) | Out-Null
+    $contextMenu.Items.Add($separator2) | Out-Null
     $contextMenu.Items.Add($script:menuChargerOn) | Out-Null
     $contextMenu.Items.Add($script:menuChargerOff) | Out-Null
-    $contextMenu.Items.Add($separator2) | Out-Null
+    $contextMenu.Items.Add($separator3) | Out-Null
     $contextMenu.Items.Add($exitMenuItem) | Out-Null
 
     $script:trayIcon.ContextMenuStrip = $contextMenu
@@ -668,11 +807,13 @@ $script:trayIcon = $null
 try {
     Write-Host "--- Battery Range ---" -ForegroundColor Cyan
     Write-Host "Right-click the tray icon for options" -ForegroundColor Cyan
-    Write-Host "Modes: Auto ($MinBatteryLevel%-$MaxBatteryLevel%), Auto High ($MinBatteryLevelHigh%-$MaxBatteryLevelHigh%), Manual On/Off" -ForegroundColor Cyan
+    Write-Host "Modes: Auto ($MinBatteryLevel%-$MaxBatteryLevel%), Auto High ($MinBatteryLevelHigh%-$MaxBatteryLevelHigh%), Manual On/Off, To X% Once" -ForegroundColor Cyan
 
-    # Global state - Modes: "Auto", "AutoHigh", "ChargerOn", "ChargerOff"
+    # Global state - Modes: "Auto", "AutoHigh", "ChargerOn", "ChargerOff", "ToTargetOnce"
     $script:currentMode = "Auto"
-    
+    $script:previousMode = "Auto"
+    $script:targetSoC = 50
+
     # Initialize and start timer
     Initialize-Timer
     Restart-Timer
