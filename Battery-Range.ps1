@@ -14,6 +14,8 @@
     - Manual charger control override
     - System tray integration with context menu
     - Failure notifications with manual action prompts
+    - Intelligent standby handling with configurable SoC threshold
+    - Optional Wi-Fi Hotspot management for smart plug connectivity
 
 .NOTES
     File Name      : Battery-Range.ps1
@@ -53,12 +55,12 @@ SOFTWARE.
 
 [CmdletBinding()]
 param (
-    [Parameter(HelpMessage = "IP address of the Tasmota smart plug")]
-    [string]$TasmotaPlugIP = "192.168.137.101",
+    [Parameter(HelpMessage = "IP address of the smart plug")]
+    [string]$SmartplugIP = "192.168.137.101",
 
-    [Parameter(HelpMessage = "Timeout in seconds for the Tasmota smart plug")]
+    [Parameter(HelpMessage = "Timeout in seconds for the smart plug")]
     [ValidateRange(1, 5)]
-    [int]$TasmotaTimeoutSeconds = 2,
+    [int]$SmartplugTimeoutSeconds = 2,
 
     [Parameter(HelpMessage = "Timeout in seconds for confirming charging state change")]
     [ValidateRange(1, 10)]
@@ -73,7 +75,7 @@ param (
     [int]$MaxBatteryLevel = 45,
 
     [Parameter(HelpMessage = "Minimum battery level for Auto mode")]
-    [ValidateRange(10, 99)]
+    [ValidateRange(19, 99)]
     [int]$MinBatteryLevel = 35,
 
     [Parameter(HelpMessage = "Maximum battery level for Auto High mode")]
@@ -81,18 +83,48 @@ param (
     [int]$MaxBatteryLevelHigh = 80,
 
     [Parameter(HelpMessage = "Minimum battery level for Auto High mode")]
-    [ValidateRange(10, 99)]
-    [int]$MinBatteryLevelHigh = 70
+    [ValidateRange(19, 99)]
+    [int]$MinBatteryLevelHigh = 70,
+
+    [Parameter(HelpMessage = "Minimum SoC to turn off charger before standby (101 to disable)")]
+    [ValidateRange(20, 101)]
+    [int]$StandbySoCThreshold = 30,
+
+    [Parameter(HelpMessage = "Manage Windows Wi-Fi Hotspot for smart plug connectivity")]
+    [bool]$ManageWiFiHotspot = $false,
+
+    [Parameter(HelpMessage = "Timeout in seconds for activating Windows Wi-Fi Hotspot")]
+    [ValidateRange(5, 120)]
+    [int]$HotspotTimeoutSeconds = 30,
+
+    [Parameter(HelpMessage = "Maximum number of attempts to check the smart plug is reachable")]
+    [ValidateRange(2, 50)]
+    [int]$SmartplugConnectionMaxAttempts = 10
 )
 
 ##############################################################################
 
+# Load required assemblies
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
 # Validate that min < max for both ranges
-if ($MinBatteryLevel -ge $MaxBatteryLevel) {
-    throw "MinBatteryLevel ($MinBatteryLevel) must be less than MaxBatteryLevel ($MaxBatteryLevel)"
+try {
+    if ($MinBatteryLevel -ge $MaxBatteryLevel) {
+        throw "MinBatteryLevel ($MinBatteryLevel) must be less than MaxBatteryLevel ($MaxBatteryLevel)"
+    }
+    if ($MinBatteryLevelHigh -ge $MaxBatteryLevelHigh) {
+        throw "MinBatteryLevelHigh ($MinBatteryLevelHigh) must be less than MaxBatteryLevelHigh ($MaxBatteryLevelHigh)"
+    }
 }
-if ($MinBatteryLevelHigh -ge $MaxBatteryLevelHigh) {
-    throw "MinBatteryLevelHigh ($MinBatteryLevelHigh) must be less than MaxBatteryLevelHigh ($MaxBatteryLevelHigh)"
+catch {
+    [System.Windows.Forms.MessageBox]::Show(
+        $_.Exception.Message,
+        "Battery Range Configuration Error",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error
+    ) | Out-Null
+    return
 }
 
 # Single Instance Check
@@ -142,9 +174,18 @@ public class DPI {
 }
 [DPI]::SetProcessDPIAware() | out-null
 
-# Load required assemblies
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
+# Load WinRT assemblies for Mobile Hotspot control (if needed)
+if ($ManageWiFiHotspot) {
+    try {
+        Add-Type -AssemblyName System.Runtime.WindowsRuntime
+        [void][Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType=WindowsRuntime]
+        [void][Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType=WindowsRuntime]
+    }
+    catch {
+        Write-Warning "Mobile Hotspot management requires Windows 10+. Disabling feature."
+        $ManageWiFiHotspot = $false
+    }
+}
 
 # Add icon helper for destroying icon handles
 if (-not ('IconHelper' -as [type])) {
@@ -189,6 +230,92 @@ public class PowerStatus {
     }
 }
 '@
+}
+
+function Invoke-WinRTAsync {
+    param($AsyncTask, [Type]$ResultType)
+
+    $asTaskMethod = [System.WindowsRuntimeSystemExtensions].GetMethods() |
+        Where-Object {
+            $_.Name -eq 'AsTask' -and
+            $_.GetParameters().Count -eq 1 -and
+            $_.GetParameters()[0].ParameterType.Name -match 'IAsyncOperation`1'
+        } | Select-Object -First 1
+
+    if (-not $asTaskMethod) {
+        throw "Could not find AsTask method for WinRT async operations"
+    }
+
+    $task = $asTaskMethod.MakeGenericMethod($ResultType).Invoke($null, @($AsyncTask))
+    $task.Wait() | Out-Null
+    return $task.Result
+}
+
+function Enable-MobileHotspot {
+    $timestamp = Get-Date -Format "HH:mm:ss"
+
+    try {
+        $profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
+
+        if (-not $profile) {
+            Write-Host "[$timestamp] WARNING: No internet connection available for hotspot" -ForegroundColor Yellow
+            return $false
+        }
+
+        $manager = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
+        $state = $manager.TetheringOperationalState
+
+        if ($state -eq [Windows.Networking.NetworkOperators.TetheringOperationalState]::On) {
+            Write-Host "[$timestamp] Hotspot is already running" -ForegroundColor Green
+            return $true
+        }
+
+        Write-Host "[$timestamp] Starting Mobile Hotspot..." -ForegroundColor White
+
+        $result = Invoke-WinRTAsync -AsyncTask $manager.StartTetheringAsync() -ResultType ([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult])
+
+        if ($result.Status -eq [Windows.Networking.NetworkOperators.TetheringOperationStatus]::Success) {
+            Write-Host "[$timestamp] Mobile Hotspot activated" -ForegroundColor Green
+            return $true
+        }
+        else {
+            Write-Host "[$timestamp] Failed to start hotspot: $($result.Status)" -ForegroundColor Red
+            return $false
+        }
+    }
+    catch {
+        Write-Host "[$timestamp] Error enabling hotspot: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
+
+function Initialize-Hotspot {
+    if (-not $ManageWiFiHotspot) { return }
+
+    $pollIntervalMs = 1000
+    $maxIterations = [math]::Ceiling(($HotspotTimeoutSeconds * 1000) / $pollIntervalMs)
+
+    for ($i = 1; $i -le $maxIterations; $i++) {
+        Start-Sleep -Milliseconds $pollIntervalMs
+
+        if (Enable-MobileHotspot) {
+            Write-Host "Checking smart plug availability..." -ForegroundColor Cyan
+            $available = Confirm-SmartplugAvailable
+            if ($available) {
+                Write-Host "Smartplug detected" -ForegroundColor Green
+            }
+            else {
+                Write-Host "WARNING: Could not connect to the smartplug after $SmartplugConnectionMaxAttempts attempts" -ForegroundColor Red
+            }
+            return
+        }
+
+        if ($i -lt $maxIterations) {
+            Write-Host "Hotspot activation failed. Retrying in $pollIntervalMs ms... (attempt $i/$maxIterations)" -ForegroundColor Yellow
+        }
+    }
+
+    Write-Host "WARNING: Could not enable hotspot after $maxIterations attempts" -ForegroundColor Red
 }
 
 function SendWindowsNotification {
@@ -262,7 +389,7 @@ function Get-BatteryStatus {
         # Return defaults
         $script:lastBatteryStatus = @{
             BatteryCharge = 0
-            OnAC   = $true
+            OnAC = $true
         }
     }
 
@@ -271,7 +398,19 @@ function Get-BatteryStatus {
     return $script:lastBatteryStatus
 }
 
-function Set-TasmotaPlug {
+function Get-SmartplugPower {
+    $url = "http://$SmartplugIP/cm?cmnd=Power"
+
+    try {
+        $response = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec $SmartplugTimeoutSeconds
+        return $response.POWER
+    }
+    catch {
+        return ""
+    }
+}
+
+function Set-SmartplugPower {
     [CmdletBinding()]
     param (
         [Parameter(Mandatory)]
@@ -279,12 +418,18 @@ function Set-TasmotaPlug {
         [string]$State
     )
 
-    $url = "http://$TasmotaPlugIP/cm?cmnd=Power%20$State"
+    $url = "http://$SmartplugIP/cm?cmnd=Power%20$State"
 
     try {
-        $response = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec $TasmotaTimeoutSeconds
-        Write-Host "Smart plug turned $State successfully. Response: $($response.POWER)" -ForegroundColor Green
-        return $true
+        $response = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec $SmartplugTimeoutSeconds
+        $actualState = $response.POWER
+        if ($actualState -eq $State.ToUpper()) {
+            Write-Host "Smart plug turned $State successfully." -ForegroundColor Green
+            return $true
+        } else {
+            Write-Host "Smart plug responded but state is '$actualState' instead of '$State'" -ForegroundColor Yellow
+            return $false
+        }
     }
     catch {
         Write-Host "Failed to control smart plug: $($_.Exception.Message)" -ForegroundColor Red
@@ -409,7 +554,8 @@ function Update-TrayIcon {
     if ($script:lastRenderedBatteryStatus -and
         $script:lastRenderedBatteryStatus.BatteryCharge -eq $currentCharge -and
         $script:lastRenderedBatteryStatus.OnAC -eq $currentOnAC -and
-        $script:lastRenderedMode -eq $currentMode) {
+        $script:lastRenderedMode -eq $currentMode -and
+        $script:lastRenderedTargetSoC -eq $script:targetSoC) {
         return  # Nothing changed, skip update
     }
 
@@ -434,6 +580,7 @@ function Update-TrayIcon {
         OnAC = $currentOnAC
     }
     $script:lastRenderedMode = $currentMode
+    $script:lastRenderedTargetSoC = $script:targetSoC
 }
 
 function Confirm-ACState {
@@ -457,6 +604,18 @@ function Confirm-ACState {
     return $false
 }
 
+function Confirm-SmartplugAvailable {
+    for ($i = 0; $i -lt $SmartplugConnectionMaxAttempts; $i++) {
+        # No delay needed here, already covered by the timeout
+        $power = Get-SmartplugPower
+        if ($power -ne "") {
+            return $true
+        }
+    }
+
+    return $false
+}
+
 function Invoke-AutoCharging {
     param (
         [int]$BatteryCharge,
@@ -468,7 +627,7 @@ function Invoke-AutoCharging {
     # Battery LOW and NOT on AC → Need to START charging
     if ($BatteryCharge -le $MinLevel -and -not $OnAC) {
         Write-Host "Battery low ($BatteryCharge%)! Attempting to turn ON smart plug" -ForegroundColor Yellow
-        $plugSuccess = Set-TasmotaPlug -State "On"
+        $plugSuccess = Set-SmartplugPower -State "On"
         if (-not $plugSuccess) {
             SendWindowsNotification -Title "Battery Low: $BatteryCharge%" -Message "Smart plug unreachable. Please plug in the charger manually!"
         }
@@ -482,7 +641,7 @@ function Invoke-AutoCharging {
     # Battery HIGH and ON AC → Need to STOP charging
     elseif ($BatteryCharge -ge $MaxLevel -and $OnAC) {
         Write-Host "Battery sufficiently charged ($BatteryCharge%)! Attempting to turn OFF smart plug" -ForegroundColor Yellow
-        $plugSuccess = Set-TasmotaPlug -State "Off"
+        $plugSuccess = Set-SmartplugPower -State "Off"
         if (-not $plugSuccess) {
             SendWindowsNotification -Title "Battery High: $BatteryCharge%" -Message "Smart plug unreachable. Please unplug the charger manually!"
         }
@@ -514,7 +673,7 @@ function Invoke-ManualChargerControl {
     }
 
     Write-Host "Manual mode: Enforcing charger $DesiredState" -ForegroundColor Yellow
-    $plugSuccess = Set-TasmotaPlug -State $DesiredState
+    $plugSuccess = Set-SmartplugPower -State $DesiredState
 
     if (-not $plugSuccess) {
         if ($DesiredState -eq "On") {
@@ -568,7 +727,7 @@ function Invoke-BatteryCheck {
 
     $powerSource = if ($onAC) { "AC" } else { "Battery" }
     $modeDisplay = Get-ModeDisplayName -Mode $script:currentMode
-    Write-Host "$(Get-Date -Format 'HH:mm:ss') - Battery: $batteryCharge% | Power: $powerSource | Mode: $modeDisplay"
+    Write-Host "[$(Get-Date -Format 'HH:mm:ss')] - Battery: $batteryCharge% | Power: $powerSource | Mode: $modeDisplay"
 
     switch ($script:currentMode) {
         "Auto" {
@@ -630,62 +789,67 @@ function Set-Mode {
 
 function Show-TargetSoCDialog {
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = "Battery Range"
-    $form.Size = New-Object System.Drawing.Size(280, 150)
-    $form.StartPosition = "CenterScreen"
-    $form.FormBorderStyle = "FixedDialog"
-    $form.MaximizeBox = $false
-    $form.MinimizeBox = $false
-    $form.TopMost = $true
+    $selectedValue = $null
+    try {
+        $form.Text = "Battery Range"
+        $form.Size = New-Object System.Drawing.Size(280, 150)
+        $form.StartPosition = "CenterScreen"
+        $form.FormBorderStyle = "FixedDialog"
+        $form.MaximizeBox = $false
+        $form.MinimizeBox = $false
+        $form.TopMost = $true
 
-    $label = New-Object System.Windows.Forms.Label
-    $label.Location = New-Object System.Drawing.Point(15, 15)
-    $label.Size = New-Object System.Drawing.Size(240, 20)
-    $label.Text = "Enter target battery percentage:"
-    $form.Controls.Add($label)
+        $label = New-Object System.Windows.Forms.Label
+        $label.Location = New-Object System.Drawing.Point(15, 15)
+        $label.Size = New-Object System.Drawing.Size(240, 20)
+        $label.Text = "Enter target battery percentage:"
+        $form.Controls.Add($label)
 
-    $numericUpDown = New-Object System.Windows.Forms.NumericUpDown
-    $numericUpDown.Location = New-Object System.Drawing.Point(15, 40)
-    $numericUpDown.Size = New-Object System.Drawing.Size(80, 25)
-    $numericUpDown.Minimum = 10
-    $numericUpDown.Maximum = 100
-    # Default to current battery level or 50
-    $defaultValue = if ($script:lastBatteryStatus) { $script:lastBatteryStatus.BatteryCharge } else { 50 }
-    $numericUpDown.Value = [Math]::Max(10, [Math]::Min(100, $defaultValue))
-    $form.Controls.Add($numericUpDown)
+        $numericUpDown = New-Object System.Windows.Forms.NumericUpDown
+        $numericUpDown.Location = New-Object System.Drawing.Point(15, 40)
+        $numericUpDown.Size = New-Object System.Drawing.Size(80, 25)
+        $numericUpDown.Minimum = 20
+        $numericUpDown.Maximum = 100
+        # Default to current battery level or 50
+        $defaultValue = if ($script:lastBatteryStatus) { $script:lastBatteryStatus.BatteryCharge } else { 50 }
+        $numericUpDown.Value = [Math]::Max(20, [Math]::Min(100, $defaultValue))
+        $form.Controls.Add($numericUpDown)
 
-    $percentLabel = New-Object System.Windows.Forms.Label
-    $percentLabel.Location = New-Object System.Drawing.Point(100, 42)
-    $percentLabel.Size = New-Object System.Drawing.Size(30, 20)
-    $percentLabel.Text = "%"
-    $form.Controls.Add($percentLabel)
+        $percentLabel = New-Object System.Windows.Forms.Label
+        $percentLabel.Location = New-Object System.Drawing.Point(100, 42)
+        $percentLabel.Size = New-Object System.Drawing.Size(30, 20)
+        $percentLabel.Text = "%"
+        $form.Controls.Add($percentLabel)
 
-    $okButton = New-Object System.Windows.Forms.Button
-    $okButton.Location = New-Object System.Drawing.Point(70, 75)
-    $okButton.Size = New-Object System.Drawing.Size(75, 25)
-    $okButton.Text = "OK"
-    $okButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
-    $form.AcceptButton = $okButton
-    $form.Controls.Add($okButton)
+        $okButton = New-Object System.Windows.Forms.Button
+        $okButton.Location = New-Object System.Drawing.Point(70, 75)
+        $okButton.Size = New-Object System.Drawing.Size(75, 25)
+        $okButton.Text = "OK"
+        $okButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $form.AcceptButton = $okButton
+        $form.Controls.Add($okButton)
 
-    $cancelButton = New-Object System.Windows.Forms.Button
-    $cancelButton.Location = New-Object System.Drawing.Point(155, 75)
-    $cancelButton.Size = New-Object System.Drawing.Size(75, 25)
-    $cancelButton.Text = "Cancel"
-    $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-    $form.CancelButton = $cancelButton
-    $form.Controls.Add($cancelButton)
+        $cancelButton = New-Object System.Windows.Forms.Button
+        $cancelButton.Location = New-Object System.Drawing.Point(155, 75)
+        $cancelButton.Size = New-Object System.Drawing.Size(75, 25)
+        $cancelButton.Text = "Cancel"
+        $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+        $form.CancelButton = $cancelButton
+        $form.Controls.Add($cancelButton)
 
-    # Focus the numeric input
-    $form.Add_Shown({ $numericUpDown.Select() })
+        # Focus the numeric input
+        $form.Add_Shown({ $numericUpDown.Select() })
 
-    $result = $form.ShowDialog()
-    $form.Dispose()
-
-    if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
-        return [int]$numericUpDown.Value
+        # Get the result
+        $result = $form.ShowDialog()
+        if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+            $selectedValue = [int]$numericUpDown.Value
+        }
     }
-    return $null
+    finally {
+        $form.Dispose()
+    }
+    return $selectedValue
 }
 
 function Initialize-TrayIcon {
@@ -767,7 +931,7 @@ function Initialize-TrayIcon {
     # Event: Exit clicked
     $exitMenuItem.Add_Click({
         Write-Host "Exiting - Enabling charging before shutdown" -ForegroundColor Yellow
-        Set-TasmotaPlug -State "On"
+        Set-SmartplugPower -State "On"
 
         [System.Windows.Forms.Application]::Exit()
     })
@@ -801,18 +965,115 @@ function Restart-Timer {
     $script:timer.Start()
 }
 
+function Invoke-OnUIThread {
+    param(
+        [Parameter(Mandatory)]
+        [ScriptBlock]$ScriptBlock
+    )
+
+    $control = $script:trayIcon.ContextMenuStrip
+
+    if (-not $control) {
+        Write-Warning "UI control not available for thread marshaling"
+        return
+    }
+
+    try {
+        if ($control.InvokeRequired) {
+            # We're on a background thread - marshal to UI thread
+            $control.Invoke([Action]$ScriptBlock)
+        }
+        else {
+            # Already on UI thread
+            & $ScriptBlock
+        }
+    }
+    catch [System.ObjectDisposedException] {
+        # Control was disposed (app shutting down)
+        Write-Warning "Control disposed during invoke"
+    }
+    catch [System.InvalidOperationException] {
+        # Handle was not created or other invoke issues
+        Write-Warning "Could not invoke on UI thread: $($_.Exception.Message)"
+    }
+}
+
+function Initialize-PowerEventHandler {
+    # Create event handler for power mode changes (suspend/resume)
+    $script:powerModeHandler = [Microsoft.Win32.PowerModeChangedEventHandler]{
+        param($sender, $e)
+
+        Invoke-OnUIThread -ScriptBlock {
+            $timestamp = Get-Date -Format "HH:mm:ss"
+            $mode = $e.Mode
+
+            switch ($mode) {
+                'Suspend' {
+                    Write-Host "[$timestamp] System entering standby mode" -ForegroundColor Yellow
+
+                    # Stop timer
+                    if ($script:timer) {
+                        $script:timer.Stop()
+                    }
+
+                    # Get current SoC from last known status
+                    $currentSoC = if ($script:lastBatteryStatus) {
+                        $script:lastBatteryStatus.BatteryCharge
+                    } else {
+                        0
+                    }
+
+                    if ($currentSoC -ge $StandbySoCThreshold) {
+                        Write-Host "[$timestamp] Battery at $currentSoC% (>= $StandbySoCThreshold%) - Ensuring charger is off" -ForegroundColor Yellow
+
+                        # Turn off smart plug
+                        Set-SmartplugPower -State "Off" | out-null
+                    }
+                    else {
+                        Write-Host "[$timestamp] Battery at $currentSoC% (< $StandbySoCThreshold%) - Keeping charger state" -ForegroundColor Gray
+                    }
+                }
+                'Resume' {
+                    Write-Host "[$timestamp] System waking from standby" -ForegroundColor Cyan
+
+                    # Update the tray icon
+                    Get-BatteryStatus
+
+                    # If requested, enable hotspot and check smartplug availability
+                    Initialize-Hotspot
+
+                    # Restart timer (runs immediate battery check)
+                    Restart-Timer
+                }
+            }
+        }
+    }
+
+    # Register the event handler
+    [Microsoft.Win32.SystemEvents]::add_PowerModeChanged($script:powerModeHandler)
+    Write-Host "Power event handler registered" -ForegroundColor Gray
+}
+
 # Main execution
 $script:timer = $null
 $script:trayIcon = $null
+$script:powerModeHandler = $null
 try {
     Write-Host "--- Battery Range ---" -ForegroundColor Cyan
     Write-Host "Right-click the tray icon for options" -ForegroundColor Cyan
     Write-Host "Modes: Auto ($MinBatteryLevel%-$MaxBatteryLevel%), Auto High ($MinBatteryLevelHigh%-$MaxBatteryLevelHigh%), Manual On/Off, To X% Once" -ForegroundColor Cyan
+    if ($ManageWiFiHotspot) {
+        Write-Host "Wi-Fi Hotspot management: Enabled" -ForegroundColor Cyan
+    }
+    Write-Host "Standby SoC threshold: $StandbySoCThreshold%" -ForegroundColor Cyan
 
     # Global state - Modes: "Auto", "AutoHigh", "ChargerOn", "ChargerOff", "ToTargetOnce"
     $script:currentMode = "Auto"
     $script:previousMode = "Auto"
     $script:targetSoC = 50
+
+    # Enable hotspot before starting
+    Initialize-Hotspot
 
     # Initialize and start timer
     Initialize-Timer
@@ -821,11 +1082,18 @@ try {
     # Initialize tray icon
     Initialize-TrayIcon
 
+    # Register power event handler for suspend/resume
+    Initialize-PowerEventHandler
+
     # Run the Windows Forms application message loop
     [System.Windows.Forms.Application]::Run()
 }
 finally {
     # Cleanup on exit
+    if ($script:powerModeHandler) {
+        [Microsoft.Win32.SystemEvents]::remove_PowerModeChanged($script:powerModeHandler)
+        Write-Host "Power event handler unregistered" -ForegroundColor Gray
+    }
     if ($script:timer) {
         $script:timer.Stop()
         $script:timer.Dispose()

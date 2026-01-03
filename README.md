@@ -1,5 +1,5 @@
 <p align="center">
-<img width="640" height="320" alt="Battery-Range" src="https://github.com/user-attachments/assets/998a9075-3fa1-4dab-bc0f-19a3f1e8af5b" />
+<img width="640" height="320" alt="Battery-Range" src="https://github.com/user-attachments/assets/7e9f58f9-c61b-4965-aaf1-337a1bdc04f5" />
 </p>
 
 # Battery-Range
@@ -18,7 +18,34 @@ Lithium-ion batteries degrade faster when kept at 100% charge or frequently deep
 - **Manual Override** - Force charger on/off when needed
 - **System Tray Integration** - Unobtrusive operation with right-click context menu
 - **Failure Notifications** - Alerts you to manually plug/unplug if smart plug is unreachable
+- **Intelligent Standby Handling** - Optionally turns off charger before sleep to prevent overnight overcharging
+- **Wi-Fi Hotspot Management** - Optionally manages Windows Mobile Hotspot for smart plug connectivity
 - **Single Instance** - Prevents multiple copies from running simultaneously
+
+## How It Works
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Auto Mode Flowchart                   │
+├─────────────────────────────────────────────────────────┤
+│   Check Battery Level (every N seconds)                 │
+│              │                                          │
+│              ▼                                          │
+│   ┌─────────────────────┐                               │
+│   │  Battery ≤ Min%     │──Yes──► Turn ON Smart Plug    │
+│   │  AND discharging?   │                               │
+│   └─────────────────────┘                               │
+│              │ No                                       │
+│              ▼                                          │
+│   ┌─────────────────────┐                               │
+│   │  Battery ≥ Max%     │──Yes──► Turn OFF Smart Plug   │
+│   │  AND charging?      │                               │
+│   └─────────────────────┘                               │
+│              │ No                                       │
+│              ▼                                          │
+│        Do Nothing                                       │
+└─────────────────────────────────────────────────────────┘
+```
 
 ## Requirements
 
@@ -39,22 +66,60 @@ Lithium-ion batteries degrade faster when kept at 100% charge or frequently deep
 
 ## Parameters
 
+### Smart Plug Configuration
+
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
-| `-TasmotaTimeoutSeconds` | 2 | 1-5 | Timeout in seconds for the Tasmota smart plug |
-| `-ConfirmationTimeoutSeconds` | 5 | 1-10 | Timeout for confirming charging state change |
-| `-CheckIntervalSeconds` | 30 | 15-300 | How often to check battery status |
+| `-SmartplugIP` | 192.168.137.101 | - | IP address of the Tasmota smart plug |
+| `-SmartplugTimeoutSeconds` | 2 | 1-5 | Timeout in seconds for smart plug requests |
+| `-SmartplugConnectionMaxAttempts` | 10 | 2-50 | Maximum attempts to verify smart plug is reachable |
+
+### Battery Levels
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `-MinBatteryLevel` | 35 | 19-99 | Minimum battery % for Auto mode |
 | `-MaxBatteryLevel` | 45 | 20-100 | Maximum battery % for Auto mode |
-| `-MinBatteryLevel` | 35 | 10-99 | Minimum battery % for Auto mode |
+| `-MinBatteryLevelHigh` | 70 | 19-99 | Minimum battery % for Auto High mode |
 | `-MaxBatteryLevelHigh` | 80 | 20-100 | Maximum battery % for Auto High mode |
-| `-MinBatteryLevelHigh` | 70 | 10-99 | Minimum battery % for Auto High mode |
 
 **Min values must be less than their corresponding Max values.**
+
+### Timing & Behavior
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `-CheckIntervalSeconds` | 30 | 15-300 | How often to check battery status |
+| `-ConfirmationTimeoutSeconds` | 5 | 1-10 | Timeout for confirming charging state change |
+| `-StandbySoCThreshold` | 30 | 20-101 | Turn off charger before standby if battery is at or above this % (set to 101 to disable) |
+
+### Wi-Fi Hotspot Management
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `-ManageWiFiHotspot` | false | - | Enable automatic Windows Mobile Hotspot management |
+| `-HotspotTimeoutSeconds` | 30 | 5-120 | Timeout for activating Windows Mobile Hotspot |
 
 ### Example with Custom Settings
 
 ```powershell
-.\Battery-Range.ps1 -TasmotaPlugIP "192.168.1.100" -MinBatteryLevel 40 -MaxBatteryLevel 60
+.\Battery-Range.ps1 -SmartplugIP "192.168.1.100" -MinBatteryLevel 40 -MaxBatteryLevel 60
+```
+
+### Example with Wi-Fi Hotspot Management
+
+```powershell
+.\Battery-Range.ps1 -ManageWiFiHotspot 1 -HotspotTimeoutSeconds 60
+```
+
+### Example with Custom Standby Behavior
+
+```powershell
+# Turn off charger before standby only if battery is 50% or higher
+.\Battery-Range.ps1 -StandbySoCThreshold 50
+
+# Disable standby charger management entirely
+.\Battery-Range.ps1 -StandbySoCThreshold 101
 ```
 
 ## Modes
@@ -78,9 +143,47 @@ The tray icon provides at-a-glance status:
 | **Text color: White** | Laptop is on battery |
 | **Border: Blue** | Auto mode |
 | **Border: Magenta** | Auto High mode |
-| **Border: Golden** | To X% Once mode |
+| **Border: Gold** | To X% Once mode |
 | **Border: Green** | Charger On mode |
 | **Border: Orange** | Charger Off mode |
+
+## Standby Behavior
+
+Battery Range intelligently handles system sleep/hibernate:
+
+- **Before Standby**: If battery is at or above `StandbySoCThreshold` (default: 30%), the charger is turned off to prevent overcharging
+- **On Resume**: Battery check timer restarts immediately, and if Wi-Fi Hotspot management is enabled, the hotspot is re-activated
+
+This is useful for scenarios where you close your laptop lid overnight while it's plugged in → the battery won't keep charging to 100% during standby.
+
+To disable this behavior, set `-StandbySoCThreshold 101`.
+
+## Wi-Fi Hotspot Management
+
+For portable setups where the smart plug connects directly to your laptop's Mobile Hotspot:
+
+- Enable with `-ManageWiFiHotspot 1`
+- The script will automatically start the Windows Mobile Hotspot on launch
+- On resume from standby, the hotspot is re-activated and smart plug connectivity is verified
+
+This feature is ideal when you don't have a shared Wi-Fi network available (e.g., traveling).
+
+## Running at Startup
+
+1. Press `Win + R`, type `shell:startup`, press Enter
+2. Create a shortcut to run the script:
+   - Right-click → New → Shortcut
+   - Target: `powershell -WindowStyle Hidden -ExecutionPolicy Bypass -Command "[path to the script]\Battery-Range.ps1 [custom parameters]"`
+   - Name: `Battery-Range`
+
+## Robustness Notes
+
+- **On Exit**: The script automatically turns the charger ON when exiting to prevent accidental battery drain
+- **On Standby**: If battery is above the standby threshold, charger is turned OFF to prevent overcharging during sleep
+- **On Resume**: Timer restarts immediately; Wi-Fi Hotspot is re-activated if managed
+- **Power Outages**: If the smart plug loses power, it will restore its previous state when power returns (default Tasmota behavior)
+- **Plug Failures**: If the smart plug is unreachable, a Windows notification prompts manual action
+- **Wiring Issues**: If the battery charging status is inconsistent with the smart plug status, a notification prompts the user to check the charger connection
 
 ## Tasmota Smart Plug Setup
 
@@ -118,48 +221,6 @@ Backlog IPAddress1 192.168.1.101; IPAddress2 192.168.1.1; IPAddress3 255.255.255
 
 Adjust the IP addresses to match your network configuration.
 
-## Running at Startup
-
-1. Press `Win + R`, type `shell:startup`, press Enter
-2. Create a shortcut to run the script:
-   - Right-click → New → Shortcut
-   - Target: `powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File "[path to the script]\Battery-Range.ps1"`
-   - Name: `Battery-Range`
-
-## How It Works
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    Battery-Range                        │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│   Check Battery Level (every N seconds)                 │
-│              │                                          │
-│              ▼                                          │
-│   ┌─────────────────────┐                               │
-│   │  Battery ≤ Min%     │──Yes──► Turn ON Smart Plug    │
-│   │  AND discharging?   │                               │
-│   └─────────────────────┘                               │
-│              │ No                                       │
-│              ▼                                          │
-│   ┌─────────────────────┐                               │
-│   │  Battery ≥ Max%     │──Yes──► Turn OFF Smart Plug   │
-│   │  AND charging?      │                               │
-│   └─────────────────────┘                               │
-│              │ No                                       │
-│              ▼                                          │
-│        Do Nothing                                       │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
-```
-
-## Robustness Notes
-
-- **On Exit**: The script automatically turns the charger ON when exiting to prevent accidental battery drain
-- **Power Outages**: If the smart plug loses power, it will restore its previous state when power returns (default Tasmota behavior)
-- **Plug Failures**: If the smart plug is unreachable, a Windows notification prompts manual action
-- **Wiring Issues**: If the battery charging status is inconsistent with the smart plug status, a notification prompts the user to check the charger connection 
-
 ## Troubleshooting
 
 | Issue | Solution |
@@ -168,6 +229,8 @@ Adjust the IP addresses to match your network configuration.
 | Can't connect to plug | Verify IP address and that laptop and plug are on same network |
 | Notifications not appearing | Check Windows notification settings for PowerShell |
 | Battery not detected | Ensure running on a laptop with battery installed |
+| Hotspot won't start | Ensure Wi-Fi adapter supports hosted networks and no other app is using it |
+| "Already running" message | Check system tray for existing instance or restart explorer.exe |
 
 ## License
 
@@ -180,5 +243,3 @@ Contributions are welcome! Please open an issue or submit a pull request.
 ## Acknowledgments
 
 - [Tasmota](https://github.com/arendst/tasmota) - Open source firmware for ESP8266/ESP32 devices
-
-
