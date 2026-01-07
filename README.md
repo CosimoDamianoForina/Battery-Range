@@ -18,7 +18,7 @@ Lithium-ion batteries degrade faster when kept at 100% charge or frequently deep
 - **Manual Override** - Force charger on/off when needed
 - **System Tray Integration** - Unobtrusive operation with right-click context menu
 - **Failure Notifications** - Alerts you to manually plug/unplug if smart plug is unreachable
-- **Intelligent Standby Handling** - Optionally turns off charger before sleep to prevent overnight overcharging
+- **Intelligent Standby Handling** - Configurable thresholds to manage charging before sleep
 - **Wi-Fi Hotspot Management** - Optionally manages Windows Mobile Hotspot for smart plug connectivity
 - **Single Instance** - Prevents multiple copies from running simultaneously
 
@@ -73,6 +73,7 @@ Lithium-ion batteries degrade faster when kept at 100% charge or frequently deep
 | `-SmartplugIP` | 192.168.137.101 | - | IP address of the Tasmota smart plug |
 | `-SmartplugTimeoutSeconds` | 2 | 1-5 | Timeout in seconds for smart plug requests |
 | `-SmartplugConnectionMaxAttempts` | 10 | 2-50 | Maximum attempts to verify smart plug is reachable |
+| `-SmartplugCommunicationMaxAttempts` | 3 | 1-10 | Maximum attempts to send commands to the smart plug |
 
 ### Battery Levels
 
@@ -91,7 +92,15 @@ Lithium-ion batteries degrade faster when kept at 100% charge or frequently deep
 |-----------|---------|-------|-------------|
 | `-CheckIntervalSeconds` | 30 | 15-300 | How often to check battery status |
 | `-ConfirmationTimeoutSeconds` | 5 | 1-10 | Timeout for confirming charging state change |
-| `-StandbySoCThreshold` | 30 | 20-101 | Turn off charger before standby if battery is at or above this % (set to 101 to disable) |
+
+### Standby Thresholds
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `-StandbyOnSoCThreshold` | 15 | -1 to 30 | Turn ON charger before standby if battery ≤ this % (set to -1 to disable) |
+| `-StandbyOffSoCThreshold` | 30 | 20-101 | Turn OFF charger before standby if battery ≥ this % (set to 101 to disable) |
+
+**StandbyOnSoCThreshold must be less than StandbyOffSoCThreshold.** Battery levels between these thresholds will keep the current charger state.
 
 ### Wi-Fi Hotspot Management
 
@@ -115,11 +124,17 @@ Lithium-ion batteries degrade faster when kept at 100% charge or frequently deep
 ### Example with Custom Standby Behavior
 
 ```powershell
-# Turn off charger before standby only if battery is 50% or higher
-.\Battery-Range.ps1 -StandbySoCThreshold 50
+# Turn on charger if battery ≤ 20%, turn off if battery ≥ 50%
+.\Battery-Range.ps1 -StandbyOnSoCThreshold 20 -StandbyOffSoCThreshold 50
+
+# Only turn off charger before standby (disable turn-on behavior)
+.\Battery-Range.ps1 -StandbyOnSoCThreshold -1 -StandbyOffSoCThreshold 30
+
+# Only turn on charger before standby (disable turn-off behavior)
+.\Battery-Range.ps1 -StandbyOnSoCThreshold 15 -StandbyOffSoCThreshold 101
 
 # Disable standby charger management entirely
-.\Battery-Range.ps1 -StandbySoCThreshold 101
+.\Battery-Range.ps1 -StandbyOnSoCThreshold -1 -StandbyOffSoCThreshold 101
 ```
 
 ## Modes
@@ -149,14 +164,15 @@ The tray icon provides at-a-glance status:
 
 ## Standby Behavior
 
-Battery Range intelligently handles system sleep/hibernate:
+Battery Range intelligently handles system sleep with two configurable thresholds:
 
-- **Before Standby**: If battery is at or above `StandbySoCThreshold` (default: 30%), the charger is turned off to prevent overcharging
+- **Before Standby**:
+  - If battery ≤ `StandbyOnSoCThreshold` (default: 15%), charger turns ON to prevent deep discharge
+  - If battery ≥ `StandbyOffSoCThreshold` (default: 30%), charger turns OFF to prevent overcharging
+  - If battery is between thresholds, charger state is unchanged
 - **On Resume**: Battery check timer restarts immediately, and if Wi-Fi Hotspot management is enabled, the hotspot is re-activated
 
-This is useful for scenarios where you close your laptop lid overnight while it's plugged in → the battery won't keep charging to 100% during standby.
-
-To disable this behavior, set `-StandbySoCThreshold 101`.
+This is useful for scenarios like closing your laptop overnight → the battery won't overcharge if it's high, and won't deep discharge if it's low.
 
 ## Wi-Fi Hotspot Management
 
@@ -179,7 +195,7 @@ This feature is ideal when you don't have a shared Wi-Fi network available (e.g.
 ## Robustness Notes
 
 - **On Exit**: The script automatically turns the charger ON when exiting to prevent accidental battery drain
-- **On Standby**: If battery is above the standby threshold, charger is turned OFF to prevent overcharging during sleep
+- **On Standby**: Charger is turned ON if battery is low, OFF if battery is high (based on configurable thresholds)
 - **On Resume**: Timer restarts immediately; Wi-Fi Hotspot is re-activated if managed
 - **Power Outages**: If the smart plug loses power, it will restore its previous state when power returns (default Tasmota behavior)
 - **Plug Failures**: If the smart plug is unreachable, a Windows notification prompts manual action
