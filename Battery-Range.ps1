@@ -70,25 +70,29 @@ param (
     [ValidateRange(15, 300)]
     [int]$CheckIntervalSeconds = 30,
 
-    [Parameter(HelpMessage = "Maximum battery level for Auto mode")]
+    [Parameter(HelpMessage = "Maximum SoC for Auto mode")]
     [ValidateRange(20, 100)]
     [int]$MaxBatteryLevel = 45,
 
-    [Parameter(HelpMessage = "Minimum battery level for Auto mode")]
+    [Parameter(HelpMessage = "Minimum SoC for Auto mode")]
     [ValidateRange(19, 99)]
     [int]$MinBatteryLevel = 35,
 
-    [Parameter(HelpMessage = "Maximum battery level for Auto High mode")]
+    [Parameter(HelpMessage = "Maximum SoC for Auto High mode")]
     [ValidateRange(20, 100)]
     [int]$MaxBatteryLevelHigh = 80,
 
-    [Parameter(HelpMessage = "Minimum battery level for Auto High mode")]
+    [Parameter(HelpMessage = "Minimum SoC for Auto High mode")]
     [ValidateRange(19, 99)]
     [int]$MinBatteryLevelHigh = 70,
 
+    [Parameter(HelpMessage = "Maximum SoC to turn on charger before standby (-1 to disable)")]
+    [ValidateRange(-1, 30)]
+    [int]$StandbyOnSoCThreshold = 15,
+
     [Parameter(HelpMessage = "Minimum SoC to turn off charger before standby (101 to disable)")]
     [ValidateRange(20, 101)]
-    [int]$StandbySoCThreshold = 30,
+    [int]$StandbyOffSoCThreshold = 30,
 
     [Parameter(HelpMessage = "Manage Windows Wi-Fi Hotspot for smart plug connectivity")]
     [bool]$ManageWiFiHotspot = $false,
@@ -99,7 +103,11 @@ param (
 
     [Parameter(HelpMessage = "Maximum number of attempts to check the smart plug is reachable")]
     [ValidateRange(2, 50)]
-    [int]$SmartplugConnectionMaxAttempts = 10
+    [int]$SmartplugConnectionMaxAttempts = 10,
+
+    [Parameter(HelpMessage = "Maximum number of attempts to communicate with the smartplug")]
+    [ValidateRange(1, 10)]
+    [int]$SmartplugCommunicationMaxAttempts = 3
 )
 
 ##############################################################################
@@ -108,13 +116,16 @@ param (
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# Validate that min < max for both ranges
+# Validate SoC thresholds
 try {
     if ($MinBatteryLevel -ge $MaxBatteryLevel) {
         throw "MinBatteryLevel ($MinBatteryLevel) must be less than MaxBatteryLevel ($MaxBatteryLevel)"
     }
     if ($MinBatteryLevelHigh -ge $MaxBatteryLevelHigh) {
         throw "MinBatteryLevelHigh ($MinBatteryLevelHigh) must be less than MaxBatteryLevelHigh ($MaxBatteryLevelHigh)"
+    }
+    if ($StandbyOnSoCThreshold -ge $StandbyOffSoCThreshold) {
+        throw "StandbyOnSoCThreshold ($StandbyOnSoCThreshold) must be less than StandbyOffSoCThreshold ($StandbyOffSoCThreshold)"
     }
 }
 catch {
@@ -296,8 +307,6 @@ function Initialize-Hotspot {
     $maxIterations = [math]::Ceiling(($HotspotTimeoutSeconds * 1000) / $pollIntervalMs)
 
     for ($i = 1; $i -le $maxIterations; $i++) {
-        Start-Sleep -Milliseconds $pollIntervalMs
-
         if (Enable-MobileHotspot) {
             Write-Host "Checking smart plug availability..." -ForegroundColor Cyan
             $available = Confirm-SmartplugAvailable
@@ -313,6 +322,8 @@ function Initialize-Hotspot {
         if ($i -lt $maxIterations) {
             Write-Host "Hotspot activation failed. Retrying in $pollIntervalMs ms... (attempt $i/$maxIterations)" -ForegroundColor Yellow
         }
+
+        Start-Sleep -Milliseconds $pollIntervalMs
     }
 
     Write-Host "WARNING: Could not enable hotspot after $maxIterations attempts" -ForegroundColor Red
@@ -374,7 +385,7 @@ function Get-BatteryStatus {
 
         # BatteryLifePercent: 0-100, or 255 if unknown/no battery
         $batteryCharge = $status.BatteryLifePercent
-        if ($batteryCharge -eq 255) {
+        if ($batteryCharge -ge 101) {
             Write-Warning "Battery percentage unknown (no battery?) - assuming 0%"
             $batteryCharge = 0
         }
@@ -418,23 +429,31 @@ function Set-SmartplugPower {
         [string]$State
     )
 
+    Initialize-Hotspot
+
     $url = "http://$SmartplugIP/cm?cmnd=Power%20$State"
 
-    try {
-        $response = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec $SmartplugTimeoutSeconds
-        $actualState = $response.POWER
-        if ($actualState -eq $State.ToUpper()) {
-            Write-Host "Smart plug turned $State successfully." -ForegroundColor Green
-            return $true
-        } else {
-            Write-Host "Smart plug responded but state is '$actualState' instead of '$State'" -ForegroundColor Yellow
-            return $false
+    for ($attempt = 1; $attempt -le $SmartplugCommunicationMaxAttempts; $attempt++) {
+        try {
+            $response = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec $SmartplugTimeoutSeconds
+            $actualState = $response.POWER
+            if ($actualState -ieq $State) {  # Case-insensitive
+                Write-Host "Smart plug turned $State successfully." -ForegroundColor Green
+                return $true
+            } else {
+                Write-Host "Smart plug responded but state is '$actualState' instead of '$State'" -ForegroundColor Yellow
+            }
+        }
+        catch {
+            Write-Host "Attempt $attempt/$SmartplugCommunicationMaxAttempts failed: $($_.Exception.Message)" -ForegroundColor Yellow
+            if ($attempt -lt $SmartplugCommunicationMaxAttempts) {
+                Start-Sleep -Milliseconds 500
+            }
         }
     }
-    catch {
-        Write-Host "Failed to control smart plug: $($_.Exception.Message)" -ForegroundColor Red
-        return $false
-    }
+
+    Write-Host "Failed to control smart plug after $SmartplugCommunicationMaxAttempts attempts" -ForegroundColor Red
+    return $false
 }
 
 function Get-ModeDisplayName {
@@ -559,15 +578,19 @@ function Update-TrayIcon {
         return  # Nothing changed, skip update
     }
 
-    $icon = Draw-BatteryIcon `
-        -BatteryPercent $currentCharge `
-        -OnAC $currentOnAC `
-        -Mode $currentMode
+    $newIcon = $null
+    try {
+        $newIcon = Draw-BatteryIcon -BatteryPercent $currentCharge -OnAC $currentOnAC -Mode $currentMode
 
-    # Assign new icon and dispose old one
-    $oldIcon = $script:trayIcon.Icon
-    $script:trayIcon.Icon = $icon
-    if ($oldIcon) { $oldIcon.Dispose() }
+        # Assign new icon and dispose old one
+        $oldIcon = $script:trayIcon.Icon
+        $script:trayIcon.Icon = $newIcon
+        if ($oldIcon) { $oldIcon.Dispose() }
+    }
+    catch {
+        if ($newIcon) { $newIcon.Dispose() }
+        Write-Warning "Failed to update tray icon: $($_.Exception.Message)"
+    }
 
     $powerText = if ($currentOnAC) { "On AC" } else { "On Battery" }
     $modeDisplay = Get-ModeDisplayName -Mode $currentMode
@@ -606,13 +629,14 @@ function Confirm-ACState {
 
 function Confirm-SmartplugAvailable {
     for ($i = 0; $i -lt $SmartplugConnectionMaxAttempts; $i++) {
-        # No delay needed here, already covered by the timeout
         $power = Get-SmartplugPower
         if ($power -ne "") {
             return $true
         }
+        if ($i -lt ($SmartplugConnectionMaxAttempts - 1)) {
+            Start-Sleep -Milliseconds 500  # Small backoff
+        }
     }
-
     return $false
 }
 
@@ -1019,18 +1043,22 @@ function Initialize-PowerEventHandler {
                     # Get current SoC from last known status
                     $currentSoC = if ($script:lastBatteryStatus) {
                         $script:lastBatteryStatus.BatteryCharge
-                    } else {
-                        0
-                    }
+                    } else { 50 }
 
-                    if ($currentSoC -ge $StandbySoCThreshold) {
-                        Write-Host "[$timestamp] Battery at $currentSoC% (>= $StandbySoCThreshold%) - Ensuring charger is off" -ForegroundColor Yellow
+                    if ($currentSoC -ge $StandbyOffSoCThreshold) {
+                        Write-Host "[$timestamp] Battery at $currentSoC% (>= $StandbyOffSoCThreshold%) - Ensuring charger is off" -ForegroundColor Yellow
 
                         # Turn off smart plug
                         Set-SmartplugPower -State "Off" | out-null
                     }
+                    elseif ($currentSoC -le $StandbyOnSoCThreshold) {
+                        Write-Host "[$timestamp] Battery at $currentSoC% (<= $StandbyOnSoCThreshold%) - Ensuring charger is on" -ForegroundColor Yellow
+
+                        # Turn on smart plug
+                        Set-SmartplugPower -State "On" | out-null
+                    }
                     else {
-                        Write-Host "[$timestamp] Battery at $currentSoC% (< $StandbySoCThreshold%) - Keeping charger state" -ForegroundColor Gray
+                        Write-Host "[$timestamp] Battery at $currentSoC% - Keeping charger state" -ForegroundColor Gray
                     }
                 }
                 'Resume' {
@@ -1065,7 +1093,7 @@ try {
     if ($ManageWiFiHotspot) {
         Write-Host "Wi-Fi Hotspot management: Enabled" -ForegroundColor Cyan
     }
-    Write-Host "Standby SoC threshold: $StandbySoCThreshold%" -ForegroundColor Cyan
+    Write-Host "Standby SoC thresholds: $StandbyOnSoCThreshold%, $StandbyOffSoCThreshold%" -ForegroundColor Cyan
 
     # Global state - Modes: "Auto", "AutoHigh", "ChargerOn", "ChargerOff", "ToTargetOnce"
     $script:currentMode = "Auto"
